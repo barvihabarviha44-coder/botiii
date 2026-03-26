@@ -1,9 +1,8 @@
-import re
 from aiogram import Router, F
 from aiogram.types import Message
 from config import ADMIN_IDS
 from database import db
-from utils import format_number, format_coins, format_vibeton
+from utils import format_number
 
 admin_router = Router()
 
@@ -12,7 +11,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-@router.message(F.text.lower().in_(['админ', 'admin']))
+@admin_router.message(F.text.lower().in_(['админ', 'admin']))
 async def admin_panel(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -33,7 +32,7 @@ async def admin_panel(message: Message):
     await message.answer(text)
 
 
-@admin_router.message(F.text.lower().startswith('абан'))
+@admin_router.message(F.text.lower().startswith('абан '))
 async def admin_ban(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -53,7 +52,7 @@ async def admin_ban(message: Message):
     await message.answer(f"✅ Пользователь `{target_id}` забанен!")
 
 
-@admin_router.message(F.text.lower().startswith('аразбан'))
+@admin_router.message(F.text.lower().startswith('аразбан '))
 async def admin_unban(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -73,7 +72,7 @@ async def admin_unban(message: Message):
     await message.answer(f"✅ Пользователь `{target_id}` разбанен!")
 
 
-@admin_router.message(F.text.lower().startswith('авыдатьvt'))
+@admin_router.message(F.text.lower().startswith('авыдатьvt '))
 async def admin_give_vt(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -94,7 +93,7 @@ async def admin_give_vt(message: Message):
     await message.answer(f"✅ Выдано **{amount:.2f} VT** → `{target_id}`")
 
 
-@admin_router.message(F.text.lower().startswith('авыдать'))
+@admin_router.message(F.text.lower().startswith('авыдать '))
 async def admin_give(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -115,8 +114,8 @@ async def admin_give(message: Message):
     await message.answer(f"✅ Выдано **{format_number(amount)} VC** → `{target_id}`")
 
 
-@admin_router.message(F.text.lower().startswith('астат'))
-async def admin_stats(message: Message):
+@admin_router.message(F.text.lower().startswith('астат '))
+async def admin_user_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
     
@@ -151,14 +150,17 @@ async def admin_stats(message: Message):
     await message.answer(text)
 
 
-@admin_router.message(F.text.lower().startswith('апромо'))
+@admin_router.message(F.text.lower().startswith('апромо '))
 async def admin_create_promo(message: Message):
     if not is_admin(message.from_user.id):
         return
     
     parts = message.text.split()
     if len(parts) < 5:
-        await message.answer("❌ Использование: `апромо КОД vc vt макс`\nПример: `апромо TEST 10000 0 100`")
+        await message.answer(
+            "❌ Использование: `апромо КОД vc vt макс`\n"
+            "Пример: `апромо TEST 10000 0 100`"
+        )
         return
     
     try:
@@ -199,3 +201,42 @@ async def admin_global_stats(message: Message):
     )
     
     await message.answer(text)
+
+
+@admin_router.message(F.text.lower().startswith('арассылка '))
+async def admin_broadcast(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    text = message.text[10:]  # Убираем "арассылка "
+    
+    if not text:
+        await message.answer("❌ Использование: `арассылка текст сообщения`")
+        return
+    
+    users = await db.get_all_users()
+    
+    success = 0
+    failed = 0
+    
+    status_msg = await message.answer(f"📢 Начинаю рассылку... 0/{len(users)}")
+    
+    for user in users:
+        try:
+            await message.bot.send_message(user['user_id'], text)
+            success += 1
+        except:
+            failed += 1
+        
+        # Обновляем статус каждые 10 сообщений
+        if (success + failed) % 10 == 0:
+            try:
+                await status_msg.edit_text(f"📢 Рассылка... {success + failed}/{len(users)}")
+            except:
+                pass
+    
+    await status_msg.edit_text(
+        f"✅ **Рассылка завершена!**\n\n"
+        f"📨 Успешно: {success}\n"
+        f"❌ Ошибок: {failed}"
+    )
