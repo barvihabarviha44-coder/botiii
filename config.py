@@ -1,8 +1,29 @@
 import os
+from dotenv import load_dotenv
 
+# Загружаем переменные из .env файла (для локальной разработки)
+load_dotenv()
+
+# Токен бота
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN not found! Set it in environment variables")
+
+# URL базы данных
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
+if not DATABASE_URL:
+    raise ValueError("❌ DATABASE_URL not found! Set it in environment variables")
+
+# Фикс для Railway PostgreSQL URL
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Админы
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()]
+
+if not ADMIN_IDS:
+    print("⚠️ Warning: No admin IDs set!")
 
 # Эмодзи премиум
 EMOJI = {
@@ -115,3 +136,8 @@ JOBS_CONFIG = {
         "description": "Руководство крупной корпорацией"
     }
 }
+
+print(f"✅ Config loaded")
+print(f"📊 Bot Token: {'✅ Set' if BOT_TOKEN else '❌ Missing'}")
+print(f"🗄️ Database URL: {'✅ Set' if DATABASE_URL else '❌ Missing'}")
+print(f"👑 Admins: {len(ADMIN_IDS)} configured")
