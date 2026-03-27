@@ -2,7 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message
 from config import ADMIN_IDS
 from database import db
-from utils import format_number
+from utils import format_num
 
 admin_router = Router()
 
@@ -11,232 +11,193 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-@admin_router.message(F.text.lower().in_(['админ', 'admin']))
+@admin_router.message(F.text.lower().in_(["админ", "admin"]))
 async def admin_panel(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
-    text = (
-        "🔐 **АДМИН-ПАНЕЛЬ**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "**Команды:**\n"
-        "`абан 123456` - забанить\n"
-        "`аразбан 123456` - разбанить\n"
-        "`авыдать 123456 10000` - выдать VC\n"
-        "`авыдатьvt 123456 5` - выдать VT\n"
-        "`астат 123456` - статистика игрока\n"
-        "`апромо КОД 10000 0 100` - создать промо\n"
-        "`астатистика` - общая статистика"
+
+    await message.answer(
+        "🔐 **АДМИНКА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        "`абан ID` — бан\n"
+        "`аразбан ID` — разбан\n"
+        "`авыдать ID сумма` — выдать VC\n"
+        "`авыдатьvt ID сумма` — выдать VT\n"
+        "`астат ID` — инфо игрока\n"
+        "`апромо КОД VC VT uses` — создать промо\n"
+        "`астатистика` — статистика бота"
     )
-    
-    await message.answer(text)
 
 
-@admin_router.message(F.text.lower().startswith('абан '))
+@admin_router.message(F.text.lower().startswith("абан "))
 async def admin_ban(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
+
     parts = message.text.split()
     if len(parts) < 2:
-        await message.answer("❌ Использование: `абан 123456`")
+        await message.answer("❌ Укажи ID")
         return
-    
+
     try:
         target_id = int(parts[1])
     except:
-        await message.answer("❌ Некорректный ID!")
+        await message.answer("❌ ID неверный")
         return
-    
+
     await db.ban_user(target_id, True)
-    await message.answer(f"✅ Пользователь `{target_id}` забанен!")
+    await message.answer(f"✅ Пользователь `{target_id}` забанен")
 
 
-@admin_router.message(F.text.lower().startswith('аразбан '))
+@admin_router.message(F.text.lower().startswith("аразбан "))
 async def admin_unban(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
+
     parts = message.text.split()
     if len(parts) < 2:
-        await message.answer("❌ Использование: `аразбан 123456`")
+        await message.answer("❌ Укажи ID")
         return
-    
+
     try:
         target_id = int(parts[1])
     except:
-        await message.answer("❌ Некорректный ID!")
+        await message.answer("❌ ID неверный")
         return
-    
+
     await db.ban_user(target_id, False)
-    await message.answer(f"✅ Пользователь `{target_id}` разбанен!")
+    await message.answer(f"✅ Пользователь `{target_id}` разбанен")
 
 
-@admin_router.message(F.text.lower().startswith('авыдатьvt '))
+@admin_router.message(F.text.lower().startswith("авыдатьvt "))
 async def admin_give_vt(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
+
     parts = message.text.split()
     if len(parts) < 3:
-        await message.answer("❌ Использование: `авыдатьvt 123456 5`")
+        await message.answer("❌ Использование: авыдатьvt ID сумма")
         return
-    
+
     try:
         target_id = int(parts[1])
-        amount = float(parts[2])
+        amount = float(parts[2].replace(",", "."))
     except:
-        await message.answer("❌ Некорректные данные!")
+        await message.answer("❌ Ошибка данных")
         return
-    
+
+    user = await db.get_user(target_id)
+    if not user:
+        await message.answer("❌ Пользователь не найден")
+        return
+
     await db.update_vibeton(target_id, amount)
     await message.answer(f"✅ Выдано **{amount:.2f} VT** → `{target_id}`")
 
 
-@admin_router.message(F.text.lower().startswith('авыдать '))
-async def admin_give(message: Message):
+@admin_router.message(F.text.lower().startswith("авыдать "))
+async def admin_give_vc(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
+
     parts = message.text.split()
     if len(parts) < 3:
-        await message.answer("❌ Использование: `авыдать 123456 10000`")
+        await message.answer("❌ Использование: авыдать ID сумма")
         return
-    
+
     try:
         target_id = int(parts[1])
         amount = int(parts[2])
     except:
-        await message.answer("❌ Некорректные данные!")
+        await message.answer("❌ Ошибка данных")
         return
-    
+
+    user = await db.get_user(target_id)
+    if not user:
+        await message.answer("❌ Пользователь не найден")
+        return
+
     await db.update_coins(target_id, amount)
-    await message.answer(f"✅ Выдано **{format_number(amount)} VC** → `{target_id}`")
+    await message.answer(f"✅ Выдано **{format_num(amount)} VC** → `{target_id}`")
 
 
-@admin_router.message(F.text.lower().startswith('астат '))
+@admin_router.message(F.text.lower().startswith("астат "))
 async def admin_user_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
+
     parts = message.text.split()
     if len(parts) < 2:
-        await message.answer("❌ Использование: `астат 123456`")
+        await message.answer("❌ Использование: астат ID")
         return
-    
+
     try:
         target_id = int(parts[1])
     except:
-        await message.answer("❌ Некорректный ID!")
+        await message.answer("❌ ID неверный")
         return
-    
+
     user = await db.get_user(target_id)
     if not user:
-        await message.answer("❌ Пользователь не найден!")
+        await message.answer("❌ Пользователь не найден")
         return
-    
-    text = (
-        f"📊 **Игрок:** `{target_id}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 {user['first_name']} (@{user['username']})\n"
-        f"💎 VC: {format_number(user['coins'])}\n"
-        f"🔮 VT: {user['vibeton']:.2f}\n"
-        f"🏦 Банк: {format_number(user['bank_balance'])}\n"
-        f"🎮 Игр: {user['total_games']}\n"
-        f"🏆 Побед: {user['total_wins']}\n"
-        f"🚫 Бан: {'Да' if user['is_banned'] else 'Нет'}"
+
+    await message.answer(
+        f"📊 **ИГРОК**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 `{user['user_id']}`\n"
+        f"👤 {user['first_name']} (@{user['username']})\n\n"
+        f"💎 **{format_num(user['coins'])}** VC\n"
+        f"🔮 **{user['vibeton']:.2f}** VT\n"
+        f"🏦 **{format_num(user['bank_balance'])}** VC\n"
+        f"⭐ XP: **{user['xp']}**\n\n"
+        f"🎮 Игр: **{user['total_games']}**\n"
+        f"🏆 Побед: **{user['total_wins']}**\n"
+        f"📈 Выиграл: **{format_num(user['total_earned'])}** VC\n"
+        f"📉 Слил: **{format_num(user['total_lost'])}** VC\n"
+        f"🚫 Бан: **{'Да' if user['is_banned'] else 'Нет'}**"
     )
-    
-    await message.answer(text)
 
 
-@admin_router.message(F.text.lower().startswith('апромо '))
+@admin_router.message(F.text.lower().startswith("апромо "))
 async def admin_create_promo(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
+
     parts = message.text.split()
     if len(parts) < 5:
-        await message.answer(
-            "❌ Использование: `апромо КОД vc vt макс`\n"
-            "Пример: `апромо TEST 10000 0 100`"
-        )
+        await message.answer("❌ Использование: апромо КОД VC VT uses")
         return
-    
+
     try:
         code = parts[1].upper()
         coins = int(parts[2])
-        vibeton = float(parts[3])
-        max_uses = int(parts[4])
+        vibeton = float(parts[3].replace(",", "."))
+        uses = int(parts[4])
     except:
-        await message.answer("❌ Некорректные данные!")
+        await message.answer("❌ Ошибка данных")
         return
-    
-    await db.create_promo(code, coins, vibeton, max_uses)
-    
+
+    await db.create_promo(code, coins, vibeton, uses)
     await message.answer(
-        f"✅ **Промокод создан!**\n\n"
-        f"📝 Код: `{code}`\n"
-        f"💎 VC: {format_number(coins)}\n"
-        f"🔮 VT: {vibeton:.2f}\n"
-        f"👥 Макс: {max_uses}"
+        f"✅ **ПРОМО СОЗДАН**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎁 `{code}`\n"
+        f"💎 {format_num(coins)} VC\n"
+        f"🔮 {vibeton:.2f} VT\n"
+        f"👥 Использований: {uses}"
     )
 
 
-@admin_router.message(F.text.lower() == 'астатистика')
-async def admin_global_stats(message: Message):
+@admin_router.message(F.text.lower() == "астатистика")
+async def admin_stats(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
+
     stats = await db.get_global_stats()
-    
-    text = (
-        f"📊 **СТАТИСТИКА БОТА**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👥 Пользователей: {stats['total_users']}\n"
-        f"🚫 Забанено: {stats['banned_users']}\n"
-        f"💎 Всего VC: {format_number(stats['total_coins'])}\n"
-        f"🔮 Всего VT: {stats['total_vibeton']:.2f}\n"
-        f"🎮 Всего игр: {stats['total_games']}"
-    )
-    
-    await message.answer(text)
 
-
-@admin_router.message(F.text.lower().startswith('арассылка '))
-async def admin_broadcast(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    text = message.text[10:]  # Убираем "арассылка "
-    
-    if not text:
-        await message.answer("❌ Использование: `арассылка текст сообщения`")
-        return
-    
-    users = await db.get_all_users()
-    
-    success = 0
-    failed = 0
-    
-    status_msg = await message.answer(f"📢 Начинаю рассылку... 0/{len(users)}")
-    
-    for user in users:
-        try:
-            await message.bot.send_message(user['user_id'], text)
-            success += 1
-        except:
-            failed += 1
-        
-        # Обновляем статус каждые 10 сообщений
-        if (success + failed) % 10 == 0:
-            try:
-                await status_msg.edit_text(f"📢 Рассылка... {success + failed}/{len(users)}")
-            except:
-                pass
-    
-    await status_msg.edit_text(
-        f"✅ **Рассылка завершена!**\n\n"
-        f"📨 Успешно: {success}\n"
-        f"❌ Ошибок: {failed}"
+    await message.answer(
+        f"📊 **СТАТИСТИКА БОТА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Пользователей: **{stats['total_users']}**\n"
+        f"🚫 В бане: **{stats['banned_users']}**\n"
+        f"💎 Всего VC: **{format_num(stats['total_coins'])}**\n"
+        f"🔮 Всего VT: **{stats['total_vibeton']:.2f}**\n"
+        f"🎮 Всего игр: **{stats['total_games']}**"
     )
