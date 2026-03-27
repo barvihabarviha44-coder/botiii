@@ -1,852 +1,127 @@
-import re
 import random
 import asyncio
-import json
-from aiogram import Router, Bot, F
+from datetime import datetime, timedelta
+from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from database import db
-from config import EMOJI, GPU_CONFIG, JOBS_CONFIG, ADMIN_IDS
-from utils import format_coins, format_vibeton, parse_amount, format_number
+from config import GPU_CONFIG, JOBS_CONFIG
+from utils import format_num, parse_amount, get_level, get_xp_for_next_level, maybe_give_xp
 
 router = Router()
 
 
-# ==================== FSM STATES ====================
+class MarketStates(StatesGroup):
+    waiting_sell_amount = State()
+    waiting_sell_price = State()
 
-class GameStates(StatesGroup):
+
+class BankStates(StatesGroup):
+    waiting_deposit = State()
+    waiting_withdraw = State()
+    waiting_transfer_user = State()
+    waiting_transfer_amount = State()
+
+
+class ElectionStates(StatesGroup):
     waiting_bet = State()
-    waiting_choice = State()
 
 
-# ==================== ПРОФИЛЬ (компактный) ====================
+# ==================== ПРОФИЛЬ ====================
 
 @router.message(F.text.lower().in_(['я', 'б', 'проф', 'профиль', 'п', 'баланс']))
 async def profile_handler(message: Message):
     user = await db.get_user(message.from_user.id)
     if not user:
-        await db.create_user(
-            message.from_user.id,
-            message.from_user.username,
-            message.from_user.first_name
-        )
+        await db.create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
         user = await db.get_user(message.from_user.id)
     
-    winrate = (user['total_wins'] / user['total_games'] * 100) if user['total_games'] > 0 else 0
+    level = get_level(user['xp'])
+    next_xp = get_xp_for_next_level(level)
     
     text = (
         f"👤 **{message.from_user.first_name}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 Баланс: **{format_number(user['coins'])} VC**\n"
-        f"🔮 VibeTon: **{user['vibeton']:.2f} VT**\n"
-        f"🏦 Банк: **{format_number(user['bank_balance'])} VC**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎮 Игр: {user['total_games']} | 🏆 Побед: {user['total_wins']}\n"
-        f"📈 Винрейт: {winrate:.1f}%"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 `{message.from_user.id}`\n\n"
+        f"💎 **{format_num(user['coins'])}** VC\n"
+        f"🔮 **{user['vibeton']:.2f}** VT\n"
+        f"🏦 **{format_num(user['bank_balance'])}** VC\n\n"
+        f"⭐ Уровень: **{level}** ({user['xp']}/{next_xp} XP)\n\n"
+        f"🎮 Игр: **{user['total_games']}**\n"
+        f"🏆 Побед: **{user['total_wins']}**\n"
+        f"📈 Выиграл: **{format_num(user['total_earned'])}** VC\n"
+        f"📉 Слил: **{format_num(user['total_lost'])}** VC"
     )
+    
+    president = await db.get_president()
+    if president and president['user_id'] == message.from_user.id:
+        taxes = await db.get_president_taxes_today(message.from_user.id)
+        text += f"\n\n👑 **Ты президент!**\n💰 Налоги сегодня: **{format_num(taxes)}** VC"
     
     await message.answer(text)
-
-
-# ==================== ИГРА: АЛМАЗЫ ====================
-
-@router.message(F.text.lower().startswith('алмаз'))
-async def diamond_start(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("💎 **Алмазы**\n\nИспользование: `алмазы 1000`")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        await message.answer("❌ Сначала напиши /start")
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    
-    if bet <= 0:
-        await message.answer("❌ Укажи ставку!")
-        return
-    if bet > user['coins']:
-        await message.answer("❌ Недостаточно монет!")
-        return
-    
-    # Создаем игру
-    diamond_pos = random.randint(0, 3)
-    state = {'diamond': diamond_pos, 'level': 1, 'bet': bet}
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    # Сохраняем состояние в callback_data
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="❓", callback_data=f"gem_{bet}_{diamond_pos}_0"),
-            InlineKeyboardButton(text="❓", callback_data=f"gem_{bet}_{diamond_pos}_1"),
-        ],
-        [
-            InlineKeyboardButton(text="❓", callback_data=f"gem_{bet}_{diamond_pos}_2"),
-            InlineKeyboardButton(text="❓", callback_data=f"gem_{bet}_{diamond_pos}_3"),
-        ]
-    ])
-    
-    await message.answer(
-        f"💎 **АЛМАЗЫ**\n\n"
-        f"💰 Ставка: {format_number(bet)} VC\n"
-        f"🎯 Найди алмаз!",
-        reply_markup=keyboard
-    )
-
-
-@router.callback_query(F.data.startswith('gem_'))
-async def diamond_callback(callback: CallbackQuery):
-    parts = callback.data.split('_')
-    bet = int(parts[1])
-    diamond_pos = int(parts[2])
-    chosen = int(parts[3])
-    
-    if chosen == diamond_pos:
-        # Выиграл
-        win = int(bet * 1.8)
-        await db.update_coins(callback.from_user.id, win)
-        await db.update_stats(callback.from_user.id, True, win)
-        
-        await callback.message.edit_text(
-            f"💎 **ПОБЕДА!**\n\n"
-            f"✅ Ты нашел алмаз!\n"
-            f"💰 Выигрыш: **{format_number(win)} VC**"
-        )
-    else:
-        # Проиграл
-        await db.update_stats(callback.from_user.id, False, bet)
-        
-        await callback.message.edit_text(
-            f"💎 **ПРОИГРЫШ**\n\n"
-            f"❌ Алмаз был в другой ячейке\n"
-            f"💔 -{format_number(bet)} VC"
-        )
-    
-    await callback.answer()
-
-
-# ==================== ИГРА: МИНЫ ====================
-
-@router.message(F.text.lower().startswith('мин'))
-async def mines_start(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("💣 **Мины**\n\nИспользование: `мины 1000`")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    # Создаем поле 3x3 с 3 минами
-    cells = list(range(9))
-    mines = random.sample(cells, 3)
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    # Кодируем мины в строку
-    mines_str = ','.join(map(str, mines))
-    
-    keyboard = []
-    for row in range(3):
-        row_btns = []
-        for col in range(3):
-            cell = row * 3 + col
-            row_btns.append(
-                InlineKeyboardButton(
-                    text="🟦",
-                    callback_data=f"mine_{bet}_{mines_str}_0_{cell}"
-                )
-            )
-        keyboard.append(row_btns)
-    
-    await message.answer(
-        f"💣 **МИНЫ**\n\n"
-        f"💰 Ставка: {format_number(bet)} VC\n"
-        f"💣 Мин: 3 | 🎯 Открывай ячейки!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
-
-
-@router.callback_query(F.data.startswith('mine_'))
-async def mines_callback(callback: CallbackQuery):
-    parts = callback.data.split('_')
-    bet = int(parts[1])
-    mines = list(map(int, parts[2].split(',')))
-    opened_count = int(parts[3])
-    chosen = int(parts[4])
-    
-    if chosen in mines:
-        # Попал на мину
-        await db.update_stats(callback.from_user.id, False, bet)
-        
-        # Показываем все мины
-        keyboard = []
-        for row in range(3):
-            row_btns = []
-            for col in range(3):
-                cell = row * 3 + col
-                if cell in mines:
-                    text = "💣"
-                elif cell == chosen:
-                    text = "💥"
-                else:
-                    text = "🟦"
-                row_btns.append(InlineKeyboardButton(text=text, callback_data="none"))
-            keyboard.append(row_btns)
-        
-        await callback.message.edit_text(
-            f"💣 **ВЗРЫВ!**\n\n"
-            f"💔 Проигрыш: {format_number(bet)} VC",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-        )
-    else:
-        # Безопасная ячейка
-        opened_count += 1
-        mult = 1 + (opened_count * 0.5)
-        
-        if opened_count >= 6:
-            # Макс выигрыш
-            win = int(bet * mult)
-            await db.update_coins(callback.from_user.id, win)
-            await db.update_stats(callback.from_user.id, True, win)
-            
-            await callback.message.edit_text(
-                f"💣 **ПОБЕДА!**\n\n"
-                f"✅ Открыто: {opened_count}/6\n"
-                f"💰 Выигрыш: **{format_number(win)} VC**"
-            )
-        else:
-            # Продолжаем
-            mines_str = ','.join(map(str, mines))
-            
-            keyboard = []
-            for row in range(3):
-                row_btns = []
-                for col in range(3):
-                    cell = row * 3 + col
-                    if cell == chosen:
-                        text = "💎"
-                        cb = "none"
-                    else:
-                        text = "🟦"
-                        cb = f"mine_{bet}_{mines_str}_{opened_count}_{cell}"
-                    row_btns.append(InlineKeyboardButton(text=text, callback_data=cb))
-                keyboard.append(row_btns)
-            
-            # Кнопка забрать
-            win = int(bet * mult)
-            keyboard.append([
-                InlineKeyboardButton(
-                    text=f"💰 Забрать {format_number(win)} VC (x{mult:.1f})",
-                    callback_data=f"mine_take_{win}"
-                )
-            ])
-            
-            await callback.message.edit_text(
-                f"💣 **МИНЫ**\n\n"
-                f"✅ Открыто: {opened_count}/6\n"
-                f"📈 Множитель: x{mult:.1f}",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-            )
-    
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith('mine_take_'))
-async def mines_take(callback: CallbackQuery):
-    win = int(callback.data.split('_')[2])
-    
-    await db.update_coins(callback.from_user.id, win)
-    await db.update_stats(callback.from_user.id, True, win)
-    
-    await callback.message.edit_text(
-        f"💣 **ЗАБРАЛ!**\n\n"
-        f"💰 Выигрыш: **{format_number(win)} VC**"
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "none")
-async def none_callback(callback: CallbackQuery):
-    await callback.answer()
-
-
-# ==================== ИГРА: РУЛЕТКА ====================
-
-@router.message(F.text.lower().startswith('рулетка'))
-async def roulette_game(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 3:
-        await message.answer(
-            "🎡 **Рулетка**\n\n"
-            "Использование: `рулетка 1000 красное`\n\n"
-            "Ставки: красное, черное, зеро, 1-12, 13-24, 25-36"
-        )
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    bet_type = parts[2]
-    
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    # Крутим рулетку
-    result = random.randint(0, 36)
-    
-    red_numbers = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
-    color = "🟢" if result == 0 else ("🔴" if result in red_numbers else "⚫")
-    
-    won = False
-    mult = 0
-    
-    if bet_type in ['красное', 'красный', 'кра', 'red']:
-        if result in red_numbers:
-            won = True
-            mult = 2
-    elif bet_type in ['черное', 'черный', 'чер', 'black']:
-        if result != 0 and result not in red_numbers:
-            won = True
-            mult = 2
-    elif bet_type in ['зеро', 'zero', '0']:
-        if result == 0:
-            won = True
-            mult = 36
-    elif bet_type == '1-12':
-        if 1 <= result <= 12:
-            won = True
-            mult = 3
-    elif bet_type == '13-24':
-        if 13 <= result <= 24:
-            won = True
-            mult = 3
-    elif bet_type == '25-36':
-        if 25 <= result <= 36:
-            won = True
-            mult = 3
-    
-    if won:
-        win = bet * mult
-        await db.update_coins(message.from_user.id, win - bet)
-        await db.update_stats(message.from_user.id, True, win)
-        text = f"🎡 Выпало: {color} **{result}**\n\n✅ Выигрыш: **{format_number(win)} VC**"
-    else:
-        await db.update_coins(message.from_user.id, -bet)
-        await db.update_stats(message.from_user.id, False, bet)
-        text = f"🎡 Выпало: {color} **{result}**\n\n❌ Проигрыш: {format_number(bet)} VC"
-    
-    await message.answer(text)
-
-
-# ==================== ИГРА: КРАШ ====================
-
-@router.message(F.text.lower().startswith('краш'))
-async def crash_game(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 3:
-        await message.answer("📈 **Краш**\n\nИспользование: `краш 1000 2.5`")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    
-    try:
-        cashout = float(parts[2].replace('x', '').replace(',', '.'))
-    except:
-        await message.answer("❌ Укажи множитель! Пример: `краш 1000 2.0`")
-        return
-    
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    if cashout < 1.1 or cashout > 100:
-        await message.answer("❌ Множитель от 1.1 до 100!")
-        return
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    # Генерируем точку краша
-    crash_point = round(random.uniform(1.0, 10.0), 2)
-    if random.random() < 0.1:  # 10% шанс на большой множитель
-        crash_point = round(random.uniform(5.0, 50.0), 2)
-    
-    msg = await message.answer(f"📈 **КРАШ**\n\n🚀 Запуск...")
-    
-    # Анимация
-    current = 1.0
-    while current < min(crash_point, cashout):
-        current = round(current + random.uniform(0.1, 0.3), 2)
-        await asyncio.sleep(0.4)
-        try:
-            await msg.edit_text(f"📈 **КРАШ**\n\n🚀 Множитель: **x{current}**")
-        except:
-            pass
-    
-    if cashout <= crash_point:
-        # Успел вывести
-        win = int(bet * cashout)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await msg.edit_text(
-            f"📈 **КРАШ**\n\n"
-            f"✅ Вывел на **x{cashout}**!\n"
-            f"💰 Выигрыш: **{format_number(win)} VC**"
-        )
-    else:
-        # Крашнуло
-        await db.update_stats(message.from_user.id, False, bet)
-        await msg.edit_text(
-            f"📈 **КРАШ**\n\n"
-            f"💥 Крашнуло на **x{crash_point}**\n"
-            f"❌ Проигрыш: {format_number(bet)} VC"
-        )
-
-
-# ==================== ИГРЫ С АНИМАЦИЕЙ TELEGRAM ====================
-
-@router.message(F.text.lower().startswith('футбол'))
-async def football_game(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("⚽ **Футбол**\n\nИспользование: `футбол 1000`")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    dice = await message.answer_dice(emoji="⚽")
-    value = dice.dice.value  # 1-5
-    
-    await asyncio.sleep(4)
-    
-    if value >= 3:  # Гол
-        win = int(bet * 1.8)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await message.answer(f"⚽ **ГОЛ!**\n\n💰 +{format_number(win)} VC")
-    else:
-        win = int(bet * 0.5)  # Утешительный приз
-        await db.update_coins(message.from_user.id, win)
-        await message.answer(f"⚽ **Мимо!**\n\n💰 +{format_number(win)} VC")
-
-
-@router.message(F.text.lower().startswith('баскетбол'))
-async def basketball_game(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("🏀 **Баскетбол**\n\nИспользование: `баскетбол 1000`")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    dice = await message.answer_dice(emoji="🏀")
-    value = dice.dice.value
-    
-    await asyncio.sleep(4)
-    
-    if value >= 4:  # Попал
-        win = int(bet * 2.5)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await message.answer(f"🏀 **ПОПАЛ!**\n\n💰 +{format_number(win)} VC")
-    else:
-        await db.update_stats(message.from_user.id, False, bet)
-        await message.answer(f"🏀 **Мимо!**\n\n❌ -{format_number(bet)} VC")
-
-
-@router.message(F.text.lower().startswith('боулинг'))
-async def bowling_game(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("🎳 **Боулинг**\n\nИспользование: `боулинг 1000`")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    dice = await message.answer_dice(emoji="🎳")
-    value = dice.dice.value
-    
-    await asyncio.sleep(4)
-    
-    if value == 6:  # Страйк
-        win = int(bet * 5)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await message.answer(f"🎳 **СТРАЙК!**\n\n💰 +{format_number(win)} VC")
-    elif value >= 3:
-        win = int(bet * 1.5)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await message.answer(f"🎳 Сбито: {value}\n\n💰 +{format_number(win)} VC")
-    else:
-        await db.update_stats(message.from_user.id, False, bet)
-        await message.answer(f"🎳 Сбито: {value}\n\n❌ -{format_number(bet)} VC")
-
-
-@router.message(F.text.lower().startswith('дартс'))
-async def darts_game(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("🎯 **Дартс**\n\nИспользование: `дартс 1000`")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    dice = await message.answer_dice(emoji="🎯")
-    value = dice.dice.value
-    
-    await asyncio.sleep(4)
-    
-    if value == 6:  # Центр
-        win = int(bet * 5)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await message.answer(f"🎯 **ЦЕНТР!**\n\n💰 +{format_number(win)} VC")
-    elif value >= 3:
-        win = int(bet * 1.8)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await message.answer(f"🎯 Очки: {value}\n\n💰 +{format_number(win)} VC")
-    else:
-        await db.update_stats(message.from_user.id, False, bet)
-        await message.answer(f"🎯 Мимо!\n\n❌ -{format_number(bet)} VC")
-
-
-@router.message(F.text.lower().startswith('кости'))
-async def dice_game(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 3:
-        await message.answer(
-            "🎲 **Кости**\n\n"
-            "Использование: `кости 1000 больше`\n"
-            "Варианты: больше, меньше, ровно (7)"
-        )
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
-    
-    bet = parse_amount(parts[1], user['coins'])
-    choice = parts[2]
-    
-    if bet <= 0 or bet > user['coins']:
-        await message.answer("❌ Некорректная ставка!")
-        return
-    
-    if choice not in ['больше', 'меньше', 'ровно']:
-        await message.answer("❌ Выбери: больше, меньше или ровно")
-        return
-    
-    await db.update_coins(message.from_user.id, -bet)
-    
-    dice1 = await message.answer_dice(emoji="🎲")
-    await asyncio.sleep(0.5)
-    dice2 = await message.answer_dice(emoji="🎲")
-    
-    await asyncio.sleep(3)
-    
-    total = dice1.dice.value + dice2.dice.value
-    
-    won = False
-    mult = 2
-    
-    if choice == 'больше' and total > 7:
-        won = True
-    elif choice == 'меньше' and total < 7:
-        won = True
-    elif choice == 'ровно' and total == 7:
-        won = True
-        mult = 5
-    
-    if won:
-        win = int(bet * mult)
-        await db.update_coins(message.from_user.id, win)
-        await db.update_stats(message.from_user.id, True, win)
-        await message.answer(f"🎲 Сумма: **{total}**\n\n✅ +{format_number(win)} VC")
-    else:
-        await db.update_stats(message.from_user.id, False, bet)
-        await message.answer(f"🎲 Сумма: **{total}**\n\n❌ -{format_number(bet)} VC")
 
 
 # ==================== РАБОТА ====================
 
 @router.message(F.text.lower().in_(['работа', 'работы', 'раб']))
 async def jobs_list(message: Message):
-    text = "💼 **РАБОТЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    
+    keyboard_rows = []
     for key, job in JOBS_CONFIG.items():
-        text += f"{job['emoji']} **{job['name']}**\n"
-        text += f"└ {format_number(job['min_salary'])}-{format_number(job['max_salary'])} VC\n"
-        text += f"└ Команда: `работать {key}`\n\n"
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text=f"{job['emoji']} {job['name']} ({format_num(job['min_salary'])}-{format_num(job['max_salary'])})",
+                callback_data=f"work_{key}"
+            )
+        ])
+    keyboard_rows.append([InlineKeyboardButton(text="❓ Что это?", callback_data="info_work")])
     
-    await message.answer(text)
+    await message.answer(
+        "💼 **РАБОТА**\n━━━━━━━━━━━━━━━━━━━━\n\n🔽 Выбери работу:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    )
 
 
-@router.message(F.text.lower().startswith('работать'))
-async def work_handler(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("💼 Укажи работу! Напиши `работа` для списка")
-        return
+@router.callback_query(F.data.startswith('work_'))
+async def work_callback(callback: CallbackQuery):
+    job_key = callback.data.replace('work_', '')
     
-    job_key = parts[1]
     if job_key not in JOBS_CONFIG:
-        await message.answer("❌ Работа не найдена!")
+        await callback.answer("❌ Работа не найдена!", show_alert=True)
         return
     
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        return
+    user = await db.get_user(callback.from_user.id)
+    can_work = await db.can_work(callback.from_user.id)
     
-    # Проверка кулдауна
-    can_work = await db.can_work(message.from_user.id)
     if not can_work:
-        cooldown = await db.get_work_cooldown(message.from_user.id)
-        mins = cooldown // 60
-        secs = cooldown % 60
-        await message.answer(f"⏰ Отдохни ещё **{mins}м {secs}с**")
+        cooldown = await db.get_work_cooldown(callback.from_user.id)
+        await callback.answer(f"⏰ Отдохни ещё {cooldown // 60}м {cooldown % 60}с", show_alert=True)
         return
     
     job = JOBS_CONFIG[job_key]
     salary = random.randint(job['min_salary'], job['max_salary'])
     
-    msg = await message.answer(f"{job['emoji']} Работаю **{job['name']}**...")
-    
+    await callback.message.edit_text(f"{job['emoji']} Работаю **{job['name']}**...")
     await asyncio.sleep(2)
     
-    await db.update_coins(message.from_user.id, salary)
-    await db.set_work_time(message.from_user.id)
+    await db.update_coins(callback.from_user.id, salary)
+    await db.set_work_time(callback.from_user.id)
     
-    await msg.edit_text(
-        f"{job['emoji']} **{job['name']}**\n\n"
-        f"✅ Заработано: **{format_number(salary)} VC**"
+    xp = maybe_give_xp()
+    if xp > 0:
+        await db.add_xp(callback.from_user.id, xp)
+    
+    await callback.message.edit_text(
+        f"{job['emoji']} **{job['name']}**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ Готово!\n💰 **+{format_num(salary)}** VC" + (f"\n⭐ +{xp} XP" if xp > 0 else "")
     )
 
 
-# ==================== ФЕРМА ====================
-
-@router.message(F.text.lower().in_(['ферма', 'майнинг', 'farm']))
-async def farm_handler(message: Message):
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        await db.create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-        user = await db.get_user(message.from_user.id)
-    
-    gpus = await db.get_user_gpus(message.from_user.id)
-    farm_stats = await db.get_farm_stats(message.from_user.id)
-    
-    total_per_hour = 0
-    text = "⛏️ **ФЕРМА VIBETON**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    for gpu_key, gpu_info in GPU_CONFIG.items():
-        user_gpu = next((g for g in gpus if g['gpu_type'] == gpu_key), None)
-        count = user_gpu['count'] if user_gpu else 0
-        production = count * gpu_info['vibe_per_hour']
-        total_per_hour += production
-        
-        price = await db.get_gpu_price(message.from_user.id, gpu_key, gpu_info['base_price'])
-        
-        text += f"{gpu_info['emoji']} **{gpu_info['name']}**\n"
-        text += f"└ Кол-во: {count}/10 | +{production:.1f} VT/ч\n"
-        text += f"└ Цена: {format_number(price)} VC\n\n"
-    
-    # Накопленное
-    accumulated = 0
-    if farm_stats and farm_stats['last_collect']:
-        from datetime import datetime
-        elapsed = datetime.utcnow() - farm_stats['last_collect']
-        hours = elapsed.total_seconds() / 3600
-        accumulated = total_per_hour * hours
-    
-    text += f"━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"⚡ Добыча: **{total_per_hour:.1f} VT/час**\n"
-    text += f"💎 Накоплено: **{accumulated:.2f} VT**"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 GTX 1660", callback_data="buy_gtx1660")],
-        [InlineKeyboardButton(text="🟡 RTX 3070", callback_data="buy_rtx3070")],
-        [InlineKeyboardButton(text="🔴 RTX 4090", callback_data="buy_rtx4090")],
-        [InlineKeyboardButton(text="💎 Собрать VT", callback_data="collect_vt")],
-    ])
-    
-    await message.answer(text, reply_markup=keyboard)
-
-
-@router.callback_query(F.data.startswith('buy_'))
-async def buy_gpu_callback(callback: CallbackQuery):
-    gpu_type = callback.data.replace('buy_', '')
-    
-    if gpu_type not in GPU_CONFIG:
-        await callback.answer("❌ Ошибка!")
-        return
-    
-    gpu = GPU_CONFIG[gpu_type]
-    price = await db.get_gpu_price(callback.from_user.id, gpu_type, gpu['base_price'])
-    
-    success, result = await db.buy_gpu(callback.from_user.id, gpu_type, price)
-    
-    if success:
-        await callback.answer(f"✅ Куплена {gpu['name']}!", show_alert=True)
-    elif result == "max":
-        await callback.answer("❌ Максимум 10 штук!", show_alert=True)
-    else:
-        await callback.answer("❌ Недостаточно монет!", show_alert=True)
-
-
-@router.callback_query(F.data == 'collect_vt')
-async def collect_vt_callback(callback: CallbackQuery):
-    gpus = await db.get_user_gpus(callback.from_user.id)
-    farm_stats = await db.get_farm_stats(callback.from_user.id)
-    
-    total_per_hour = sum(
-        (next((g['count'] for g in gpus if g['gpu_type'] == k), 0) * v['vibe_per_hour'])
-        for k, v in GPU_CONFIG.items()
-    )
-    
-    if not farm_stats or not farm_stats['last_collect']:
-        await callback.answer("❌ Нечего собирать!", show_alert=True)
-        return
-    
-    from datetime import datetime
-    elapsed = datetime.utcnow() - farm_stats['last_collect']
-    hours = elapsed.total_seconds() / 3600
-    accumulated = total_per_hour * hours
-    
-    if accumulated < 0.01:
-        await callback.answer("⏰ Пока нечего собирать!", show_alert=True)
-        return
-    
-    await db.collect_farm(callback.from_user.id, accumulated)
-    await callback.answer(f"✅ Собрано {accumulated:.2f} VT!", show_alert=True)
-
-
-# ==================== РЫНОК ====================
-
-@router.message(F.text.lower().in_(['рынок', 'маркет', 'market']))
-async def market_handler(message: Message):
-    price_data = await db.get_market_price()
-    
-    if not price_data:
-        price = random.randint(1000, 15000)
-        await db.update_market_price(price)
-    else:
-        from datetime import datetime, timedelta
-        if datetime.utcnow() - price_data['updated_at'] > timedelta(hours=1):
-            price = random.randint(1000, 15000)
-            await db.update_market_price(price)
-        else:
-            price = price_data['price']
-    
-    orders = await db.get_market_orders()
-    sell_orders = [o for o in orders if o['order_type'] == 'sell'][:5]
-    buy_orders = [o for o in orders if o['order_type'] == 'buy'][:5]
-    
-    text = (
-        f"🛒 **РЫНОК VIBETON**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 Курс: **{format_number(price)} VC/VT**\n\n"
-    )
-    
-    if sell_orders:
-        text += "📈 **Продают:**\n"
-        for o in sell_orders:
-            text += f"└ {o['amount']:.2f} VT по {format_number(o['price_per_unit'])} VC\n"
-        text += "\n"
-    
-    if buy_orders:
-        text += "📉 **Покупают:**\n"
-        for o in buy_orders:
-            text += f"└ {o['amount']:.2f} VT по {format_number(o['price_per_unit'])} VC\n"
-    
-    text += "\n**Команды:**\n"
-    text += "`продать 1.5 10000` - продать VT\n"
-    text += "`купитьvt 1.5 10000` - купить VT"
-    
-    await message.answer(text)
-
-
-@router.message(F.text.lower().startswith('продать'))
-async def sell_vt(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 3:
-        await message.answer("📈 Использование: `продать 1.5 10000`")
-        return
-    
-    try:
-        amount = float(parts[1])
-        price = int(parts[2])
-    except:
-        await message.answer("❌ Некорректные данные!")
-        return
-    
-    user = await db.get_user(message.from_user.id)
-    if user['vibeton'] < amount:
-        await message.answer("❌ Недостаточно VibeTon!")
-        return
-    
-    success = await db.create_market_order(message.from_user.id, 'sell', amount, price)
-    
-    if success:
-        await message.answer(f"✅ Ордер создан: {amount:.2f} VT по {format_number(price)} VC")
-    else:
-        await message.answer("❌ Ошибка создания ордера!")
+@router.callback_query(F.data == "info_work")
+async def info_work(callback: CallbackQuery):
+    await callback.answer("💼 Работа — заработок VC. Кулдаун 30 минут.", show_alert=True)
 
 
 # ==================== БАНК ====================
@@ -855,117 +130,553 @@ async def sell_vt(message: Message):
 async def bank_handler(message: Message):
     user = await db.get_user(message.from_user.id)
     
-    text = (
-        f"🏦 **БАНК**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 На руках: **{format_number(user['coins'])} VC**\n"
-        f"🏦 В банке: **{format_number(user['bank_balance'])} VC**\n\n"
-        f"**Команды:**\n"
-        f"`депозит 1000` - положить\n"
-        f"`снять 1000` - снять\n"
-        f"`перевод @user 1000` - перевести"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📥 Депозит", callback_data="bank_deposit"),
+            InlineKeyboardButton(text="📤 Снять", callback_data="bank_withdraw"),
+        ],
+        [InlineKeyboardButton(text="💸 Перевод", callback_data="bank_transfer")],
+        [InlineKeyboardButton(text="❓ Что это?", callback_data="info_bank")]
+    ])
+    
+    await message.answer(
+        f"🏦 **БАНК**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 На руках: **{format_num(user['coins'])}** VC\n"
+        f"🏦 В банке: **{format_num(user['bank_balance'])}** VC",
+        reply_markup=keyboard
     )
-    
-    await message.answer(text)
 
 
-@router.message(F.text.lower().startswith('депозит'))
-async def deposit_handler(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("🏦 Использование: `депозит 1000`")
-        return
+@router.callback_query(F.data == "bank_deposit")
+async def bank_deposit_start(callback: CallbackQuery, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
     
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="10к", callback_data="dep_10000"),
+            InlineKeyboardButton(text="100к", callback_data="dep_100000"),
+            InlineKeyboardButton(text="1кк", callback_data="dep_1000000"),
+        ],
+        [InlineKeyboardButton(text="ВСЁ", callback_data=f"dep_{user['coins']}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bank_back")]
+    ])
+    
+    await callback.message.edit_text(
+        f"📥 **ДЕПОЗИТ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Доступно: **{format_num(user['coins'])}** VC\n\n"
+        f"Выбери сумму или введи свою:",
+        reply_markup=keyboard
+    )
+    await state.set_state(BankStates.waiting_deposit)
+
+
+@router.callback_query(F.data.startswith("dep_"))
+async def bank_deposit_callback(callback: CallbackQuery, state: FSMContext):
+    amount = int(callback.data.split("_")[1])
+    
+    success = await db.deposit_to_bank(callback.from_user.id, amount)
+    await state.clear()
+    
+    if success:
+        xp = maybe_give_xp()
+        if xp > 0:
+            await db.add_xp(callback.from_user.id, xp)
+        await callback.message.edit_text(f"✅ **Депозит**\n\n🏦 +**{format_num(amount)}** VC в банк")
+    else:
+        await callback.answer("❌ Недостаточно средств!", show_alert=True)
+
+
+@router.message(BankStates.waiting_deposit)
+async def bank_deposit_message(message: Message, state: FSMContext):
     user = await db.get_user(message.from_user.id)
-    amount = parse_amount(parts[1], user['coins'])
+    amount = parse_amount(message.text, user['coins'])
     
     if amount <= 0:
         await message.answer("❌ Некорректная сумма!")
         return
     
     success = await db.deposit_to_bank(message.from_user.id, amount)
+    await state.clear()
     
     if success:
-        await message.answer(f"✅ Положено **{format_number(amount)} VC** в банк")
+        await message.answer(f"✅ 🏦 +**{format_num(amount)}** VC в банк")
     else:
         await message.answer("❌ Недостаточно средств!")
 
 
-@router.message(F.text.lower().startswith('снять'))
-async def withdraw_handler(message: Message):
-    parts = message.text.lower().split()
-    if len(parts) < 2:
-        await message.answer("🏦 Использование: `снять 1000`")
-        return
+@router.callback_query(F.data == "bank_withdraw")
+async def bank_withdraw_start(callback: CallbackQuery, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
     
-    user = await db.get_user(message.from_user.id)
-    amount = parse_amount(parts[1], user['bank_balance'])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="10к", callback_data="wth_10000"),
+            InlineKeyboardButton(text="100к", callback_data="wth_100000"),
+            InlineKeyboardButton(text="1кк", callback_data="wth_1000000"),
+        ],
+        [InlineKeyboardButton(text="ВСЁ", callback_data=f"wth_{user['bank_balance']}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bank_back")]
+    ])
     
-    if amount <= 0:
-        await message.answer("❌ Некорректная сумма!")
-        return
+    await callback.message.edit_text(
+        f"📤 **СНЯТЬ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏦 В банке: **{format_num(user['bank_balance'])}** VC",
+        reply_markup=keyboard
+    )
+    await state.set_state(BankStates.waiting_withdraw)
+
+
+@router.callback_query(F.data.startswith("wth_"))
+async def bank_withdraw_callback(callback: CallbackQuery, state: FSMContext):
+    amount = int(callback.data.split("_")[1])
     
-    success = await db.withdraw_from_bank(message.from_user.id, amount)
+    success = await db.withdraw_from_bank(callback.from_user.id, amount)
+    await state.clear()
     
     if success:
-        await message.answer(f"✅ Снято **{format_number(amount)} VC** из банка")
+        await callback.message.edit_text(f"✅ **Снято**\n\n💰 +**{format_num(amount)}** VC")
     else:
-        await message.answer("❌ Недостаточно средств в банке!")
+        await callback.answer("❌ Недостаточно средств!", show_alert=True)
 
 
-@router.message(F.text.lower().startswith('перевод'))
-async def transfer_handler(message: Message):
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.answer("💸 Использование: `перевод @username 1000`")
-        return
-    
-    target_username = parts[1].replace('@', '')
-    
-    user = await db.get_user(message.from_user.id)
-    amount = parse_amount(parts[2], user['coins'])
-    
-    target = await db.get_user_by_username(target_username)
+@router.callback_query(F.data == "bank_transfer")
+async def bank_transfer_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "💸 **ПЕРЕВОД**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Введи @username получателя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="bank_back")]])
+    )
+    await state.set_state(BankStates.waiting_transfer_user)
+
+
+@router.message(BankStates.waiting_transfer_user)
+async def bank_transfer_user(message: Message, state: FSMContext):
+    username = message.text.replace('@', '').strip()
+    target = await db.get_user_by_username(username)
     
     if not target:
         await message.answer("❌ Пользователь не найден!")
         return
-    
     if target['user_id'] == message.from_user.id:
         await message.answer("❌ Нельзя перевести себе!")
         return
+    
+    await state.update_data(target_id=target['user_id'], target_name=username)
+    await state.set_state(BankStates.waiting_transfer_amount)
+    
+    user = await db.get_user(message.from_user.id)
+    await message.answer(f"💸 **ПЕРЕВОД → @{username}**\n\n💰 Доступно: **{format_num(user['coins'])}** VC\n\nВведи сумму:")
+
+
+@router.message(BankStates.waiting_transfer_amount)
+async def bank_transfer_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user = await db.get_user(message.from_user.id)
+    amount = parse_amount(message.text, user['coins'])
     
     if amount <= 0:
         await message.answer("❌ Некорректная сумма!")
         return
     
-    success = await db.transfer_coins(message.from_user.id, target['user_id'], amount)
+    success = await db.transfer_coins(message.from_user.id, data['target_id'], amount)
+    await state.clear()
     
     if success:
-        await message.answer(f"✅ Переведено **{format_number(amount)} VC** → @{target_username}")
+        xp = maybe_give_xp()
+        if xp > 0:
+            await db.add_xp(message.from_user.id, xp)
+        await message.answer(f"✅ **Переведено**\n\n💸 **{format_num(amount)}** VC → @{data['target_name']}")
     else:
         await message.answer("❌ Недостаточно средств!")
 
 
-# ==================== ТОП ====================
+@router.callback_query(F.data == "bank_back")
+async def bank_back(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    user = await db.get_user(callback.from_user.id)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📥 Депозит", callback_data="bank_deposit"),
+            InlineKeyboardButton(text="📤 Снять", callback_data="bank_withdraw"),
+        ],
+        [InlineKeyboardButton(text="💸 Перевод", callback_data="bank_transfer")],
+        [InlineKeyboardButton(text="❓ Что это?", callback_data="info_bank")]
+    ])
+    
+    await callback.message.edit_text(
+        f"🏦 **БАНК**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 На руках: **{format_num(user['coins'])}** VC\n"
+        f"🏦 В банке: **{format_num(user['bank_balance'])}** VC",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data == "info_bank")
+async def info_bank(callback: CallbackQuery):
+    await callback.answer("🏦 Банк — храни деньги, переводи другим. Безопасно!", show_alert=True)
+    # ==================== РЫНОК ====================
+
+async def get_market_price():
+    price_data = await db.get_market_price()
+    if not price_data:
+        price = random.randint(1000, 15000)
+        await db.update_market_price(price)
+        return price
+    
+    if datetime.utcnow() - price_data['updated_at'] > timedelta(hours=1):
+        price = random.randint(1000, 15000)
+        await db.update_market_price(price)
+        return price
+    
+    return price_data['price']
+
+
+def build_market_keyboard(orders):
+    keyboard_rows = []
+
+    if orders:
+        for o in orders[:10]:
+            name = o['username'] or o['first_name'] or 'Аноним'
+            text = f"🟢 {name} | {o['amount']:.2f} VT | {format_num(o['price_per_unit'])}"
+            keyboard_rows.append([
+                InlineKeyboardButton(text=text, callback_data=f"mkt_view_{o['id']}")
+            ])
+
+    keyboard_rows.extend([
+        [
+            InlineKeyboardButton(text="🟢 Купить у бота", callback_data="mkt_buy_bot"),
+            InlineKeyboardButton(text="🔴 Продать боту", callback_data="mkt_sell_bot"),
+        ],
+        [InlineKeyboardButton(text="🟡 Создать ордер", callback_data="mkt_create")],
+        [InlineKeyboardButton(text="🔵 Мои ордера", callback_data="mkt_my")],
+        [InlineKeyboardButton(text="❓ Что это?", callback_data="info_market")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="mkt_refresh")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+@router.message(F.text.lower().in_(['рынок', 'маркет', 'market']))
+async def market_handler(message: Message):
+    price = await get_market_price()
+    sell_orders = await db.get_market_orders('sell')
+
+    text = (
+        f"🛒 **РЫНОК VT**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 Бот покупает VT по: **{format_num(price)}** VC\n"
+        f"⏰ Курс меняется каждый час\n\n"
+        f"📦 Активных ордеров: **{len(sell_orders)}**"
+    )
+
+    await message.answer(text, reply_markup=build_market_keyboard(sell_orders))
+
+
+@router.callback_query(F.data == "mkt_refresh")
+async def market_refresh(callback: CallbackQuery):
+    price = await get_market_price()
+    sell_orders = await db.get_market_orders('sell')
+
+    text = (
+        f"🛒 **РЫНОК VT**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 Бот покупает VT по: **{format_num(price)}** VC\n"
+        f"⏰ Курс меняется каждый час\n\n"
+        f"📦 Активных ордеров: **{len(sell_orders)}**"
+    )
+
+    await callback.message.edit_text(text, reply_markup=build_market_keyboard(sell_orders))
+    await callback.answer("🔄 Обновлено!")
+
+
+@router.callback_query(F.data == "info_market")
+async def info_market(callback: CallbackQuery):
+    await callback.answer(
+        "🛒 Рынок — место покупки и продажи VT.\n"
+        "🤖 Бот всегда покупает VT по текущему курсу.\n"
+        "👤 Игроки могут создавать свои ордера на продажу.",
+        show_alert=True
+    )
+
+
+@router.callback_query(F.data.startswith("mkt_view_"))
+async def market_view_order(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[2])
+    order = await db.get_order_by_id(order_id)
+
+    if not order or not order['is_active']:
+        await callback.answer("❌ Ордер не найден!", show_alert=True)
+        return
+
+    seller = await db.get_user(order['user_id'])
+    name = seller['username'] or seller['first_name'] or 'Аноним'
+    total = int(order['amount'] * order['price_per_unit'])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🟢 Купить всё ({order['amount']:.2f} VT)", callback_data=f"mkt_buyall_{order_id}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="mkt_refresh")]
+    ])
+
+    await callback.message.edit_text(
+        f"📋 **ОРДЕР**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Продавец: **{name}**\n"
+        f"🔮 Кол-во: **{order['amount']:.2f}** VT\n"
+        f"💰 Цена: **{format_num(order['price_per_unit'])}** VC/VT\n"
+        f"💵 Итого: **{format_num(total)}** VC",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data.startswith("mkt_buyall_"))
+async def market_buy_all(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[2])
+    success, result = await db.buy_from_market(callback.from_user.id, order_id)
+
+    if success:
+        total = int(result['amount'] * result['price_per_unit'])
+        xp = maybe_give_xp()
+        if xp > 0:
+            await db.add_xp(callback.from_user.id, xp)
+
+        await callback.message.edit_text(
+            f"✅ **ПОКУПКА УСПЕШНА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🔮 Куплено: **{result['amount']:.2f}** VT\n"
+            f"💰 Потрачено: **{format_num(total)}** VC"
+            + (f"\n⭐ +{xp} XP" if xp > 0 else "")
+        )
+    else:
+        errors = {
+            "not_found": "❌ Ордер не найден!",
+            "no_money": "❌ Недостаточно VC!"
+        }
+        await callback.answer(errors.get(result, "❌ Ошибка!"), show_alert=True)
+
+
+@router.callback_query(F.data == "mkt_buy_bot")
+async def market_buy_bot(callback: CallbackQuery):
+    price = await get_market_price()
+    user = await db.get_user(callback.from_user.id)
+    max_buy = user['coins'] / price if price > 0 else 0
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1 VT", callback_data="botbuy_1"),
+            InlineKeyboardButton(text="5 VT", callback_data="botbuy_5"),
+            InlineKeyboardButton(text="10 VT", callback_data="botbuy_10"),
+        ],
+        [InlineKeyboardButton(text=f"MAX ({max_buy:.2f})", callback_data="botbuy_max")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="mkt_refresh")]
+    ])
+
+    await callback.message.edit_text(
+        f"🟢 **КУПИТЬ У БОТА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 Курс: **{format_num(price)}** VC/VT\n"
+        f"💰 Баланс: **{format_num(user['coins'])}** VC\n"
+        f"🔮 Макс можно купить: **{max_buy:.2f}** VT",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data.startswith("botbuy_"))
+async def bot_buy(callback: CallbackQuery):
+    amount_str = callback.data.split("_")[1]
+    price = await get_market_price()
+    user = await db.get_user(callback.from_user.id)
+
+    amount = user['coins'] / price if amount_str == "max" else float(amount_str)
+    cost = int(amount * price)
+
+    if user['coins'] < cost:
+        await callback.answer("❌ Нет денег!", show_alert=True)
+        return
+
+    await db.update_coins(callback.from_user.id, -cost)
+    await db.update_vibeton(callback.from_user.id, amount)
+
+    xp = maybe_give_xp()
+    if xp > 0:
+        await db.add_xp(callback.from_user.id, xp)
+
+    await callback.message.edit_text(
+        f"✅ **ПОКУПКА У БОТА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔮 Куплено: **{amount:.2f}** VT\n"
+        f"💰 Потрачено: **{format_num(cost)}** VC"
+        + (f"\n⭐ +{xp} XP" if xp > 0 else "")
+    )
+
+
+@router.callback_query(F.data == "mkt_sell_bot")
+async def market_sell_bot(callback: CallbackQuery):
+    price = await get_market_price()
+    user = await db.get_user(callback.from_user.id)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1 VT", callback_data="botsell_1"),
+            InlineKeyboardButton(text="5 VT", callback_data="botsell_5"),
+            InlineKeyboardButton(text="10 VT", callback_data="botsell_10"),
+        ],
+        [InlineKeyboardButton(text=f"ВСЁ ({user['vibeton']:.2f})", callback_data="botsell_all")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="mkt_refresh")]
+    ])
+
+    await callback.message.edit_text(
+        f"🔴 **ПРОДАТЬ БОТУ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 Курс: **{format_num(price)}** VC/VT\n"
+        f"🔮 Баланс: **{user['vibeton']:.2f}** VT",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(F.data.startswith("botsell_"))
+async def bot_sell(callback: CallbackQuery):
+    amount_str = callback.data.split("_")[1]
+    price = await get_market_price()
+    user = await db.get_user(callback.from_user.id)
+
+    amount = user['vibeton'] if amount_str == "all" else float(amount_str)
+
+    if user['vibeton'] < amount:
+        await callback.answer("❌ Нет VT!", show_alert=True)
+        return
+
+    earn = int(amount * price)
+    await db.update_vibeton(callback.from_user.id, -amount)
+    await db.update_coins(callback.from_user.id, earn)
+
+    xp = maybe_give_xp()
+    if xp > 0:
+        await db.add_xp(callback.from_user.id, xp)
+
+    await callback.message.edit_text(
+        f"✅ **ПРОДАЖА БОТУ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔮 Продано: **{amount:.2f}** VT\n"
+        f"💰 Получено: **{format_num(earn)}** VC"
+        + (f"\n⭐ +{xp} XP" if xp > 0 else "")
+    )
+
+
+@router.callback_query(F.data == "mkt_create")
+async def market_create(callback: CallbackQuery, state: FSMContext):
+    user = await db.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        f"🟡 **СОЗДАТЬ ОРДЕР**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔮 Твой баланс: **{user['vibeton']:.2f}** VT\n\n"
+        f"Введи количество VT для продажи:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="mkt_refresh")]
+        ])
+    )
+    await state.set_state(MarketStates.waiting_sell_amount)
+
+
+@router.message(MarketStates.waiting_sell_amount)
+async def market_sell_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(',', '.'))
+    except:
+        await message.answer("❌ Введи число!")
+        return
+
+    user = await db.get_user(message.from_user.id)
+    if amount <= 0 or amount > user['vibeton']:
+        await message.answer(f"❌ У тебя **{user['vibeton']:.2f}** VT")
+        return
+
+    await state.update_data(sell_amount=amount)
+    await state.set_state(MarketStates.waiting_sell_price)
+
+    price = await get_market_price()
+    await message.answer(
+        f"🟡 **СОЗДАТЬ ОРДЕР**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔮 Кол-во: **{amount:.2f}** VT\n"
+        f"🤖 Курс бота: **{format_num(price)}** VC\n\n"
+        f"Введи цену за 1 VT:"
+    )
+
+
+@router.message(MarketStates.waiting_sell_price)
+async def market_sell_price(message: Message, state: FSMContext):
+    price = parse_amount(message.text, 10**18)
+    if price <= 0:
+        await message.answer("❌ Введи корректную цену!")
+        return
+
+    data = await state.get_data()
+    amount = data['sell_amount']
+
+    success = await db.create_market_order(message.from_user.id, 'sell', amount, price)
+    await state.clear()
+
+    if success:
+        xp = maybe_give_xp()
+        if xp > 0:
+            await db.add_xp(message.from_user.id, xp)
+
+        await message.answer(
+            f"✅ **ОРДЕР СОЗДАН**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🔮 **{amount:.2f}** VT\n"
+            f"💰 **{format_num(price)}** VC/VT"
+            + (f"\n⭐ +{xp} XP" if xp > 0 else "")
+        )
+    else:
+        await message.answer("❌ Недостаточно VT!")
+
+
+@router.callback_query(F.data == "mkt_my")
+async def market_my(callback: CallbackQuery):
+    orders = await db.get_user_market_orders(callback.from_user.id)
+    text = "🔵 **МОИ ОРДЕРА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    if orders:
+        for o in orders:
+            text += f"🔮 **{o['amount']:.2f}** VT по **{format_num(o['price_per_unit'])}** VC\n"
+    else:
+        text += "❌ У тебя нет активных ордеров"
+
+    keyboard_rows = [
+        [InlineKeyboardButton(text=f"❌ Отменить {o['amount']:.2f} VT", callback_data=f"mkt_cancel_{o['id']}")]
+        for o in orders
+    ]
+    keyboard_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="mkt_refresh")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows))
+
+
+@router.callback_query(F.data.startswith("mkt_cancel_"))
+async def market_cancel(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[2])
+    success = await db.cancel_market_order(callback.from_user.id, order_id)
+
+    if success:
+        await callback.answer("✅ Ордер отменён!", show_alert=True)
+        await market_my(callback)
+    else:
+        await callback.answer("❌ Ошибка!", show_alert=True)
+        # ==================== ТОП ====================
 
 @router.message(F.text.lower().in_(['топ', 'top', 'рейтинг']))
 async def top_handler(message: Message):
     top_coins = await db.get_top_coins(10)
-    
-    text = "🏆 **ТОП-10 ИГРОКОВ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    
+    top_vt = await db.get_top_vibeton(10)
+
+    text = "🏆 **ТОПЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "💎 **По VC:**\n"
     medals = ['🥇', '🥈', '🥉']
-    
+
     for i, user in enumerate(top_coins):
         medal = medals[i] if i < 3 else f"{i+1}."
         name = user['first_name'] or user['username'] or 'Аноним'
-        text += f"{medal} {name}: **{format_number(user['coins'])} VC**\n"
-    
+        text += f"{medal} {name}: **{format_num(user['coins'])}**\n"
+
+    text += "\n🔮 **По VT:**\n"
+    for i, user in enumerate(top_vt):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        name = user['first_name'] or user['username'] or 'Аноним'
+        text += f"{medal} {name}: **{user['vibeton']:.2f}**\n"
+
     await message.answer(text)
 
 
-# ==================== ПРОМОКОД ====================
+# ==================== ПРОМО ====================
 
 @router.message(F.text.lower().startswith('промо'))
 async def promo_handler(message: Message):
@@ -973,54 +684,123 @@ async def promo_handler(message: Message):
     if len(parts) < 2:
         await message.answer("🎁 Использование: `промо КОД`")
         return
-    
+
     code = parts[1].upper()
     success, result = await db.use_promo(message.from_user.id, code)
-    
+
     if success:
         rewards = []
         if result['coins_reward'] > 0:
-            rewards.append(f"💎 {format_number(result['coins_reward'])} VC")
+            rewards.append(f"💎 {format_num(result['coins_reward'])} VC")
         if result['vibeton_reward'] > 0:
             rewards.append(f"🔮 {result['vibeton_reward']:.2f} VT")
-        
-        await message.answer(f"🎁 **ПРОМОКОД АКТИВИРОВАН!**\n\nПолучено: {', '.join(rewards)}")
+
+        xp = maybe_give_xp()
+        if xp > 0:
+            await db.add_xp(message.from_user.id, xp)
+
+        await message.answer(
+            f"🎁 **ПРОМОКОД АКТИВИРОВАН**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{' | '.join(rewards)}" + (f"\n⭐ +{xp} XP" if xp > 0 else "")
+        )
     else:
         errors = {
             "not_found": "❌ Промокод не найден!",
-            "expired": "❌ Промокод истёк!",
-            "already_used": "❌ Ты уже использовал этот промокод!"
+            "expired": "❌ Промокод закончился!",
+            "already_used": "❌ Уже использован!"
         }
         await message.answer(errors.get(result, "❌ Ошибка!"))
 
 
 # ==================== ПОМОЩЬ ====================
 
-@router.message(F.text.lower().in_(['помощь', 'help', 'команды', 'хелп', 'start']))
 @router.message(CommandStart())
+@router.message(F.text.lower().in_(['помощь', 'help', 'команды', 'хелп', 'start']))
 async def help_handler(message: Message):
     await db.create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    
-    text = (
-        "🎮 **VIBEBOT**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👤 `я` - профиль\n\n"
-        "🎰 **Игры:**\n"
-        "• `алмазы 1000`\n"
-        "• `мины 1000`\n"
-        "• `рулетка 1000 красное`\n"
-        "• `краш 1000 2.0`\n"
-        "• `футбол 1000`\n"
-        "• `баскетбол 1000`\n"
-        "• `боулинг 1000`\n"
-        "• `дартс 1000`\n"
-        "• `кости 1000 больше`\n\n"
-        "💼 `работа` - работы\n"
-        "⛏️ `ферма` - майнинг VT\n"
-        "🛒 `рынок` - торговля VT\n"
-        "🏦 `банк` - депозиты\n"
-        "🏆 `топ` - рейтинг\n"
-        "🎁 `промо КОД` - промокод"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Игры", callback_data="help_games")],
+        [InlineKeyboardButton(text="💼 Системы", callback_data="help_systems")],
+        [InlineKeyboardButton(text="👑 Президент", callback_data="help_president")]
+    ])
+
+    await message.answer(
+        "🎮 **VIBEBOT**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Добро пожаловать!\n"
+        "Выбери раздел помощи:",
+        reply_markup=keyboard
     )
-    
-    await message.answer(text)
+
+
+@router.callback_query(F.data == "help_games")
+async def help_games(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🎮 **ИГРЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💣 `мины 100к`\n"
+        "💎 `алмазы 100к`\n"
+        "🎡 `рулетка 100к`\n"
+        "📈 `краш 100к 2.5`\n"
+        "🎲 `кости 100к`\n"
+        "⚽ `футбол 100к`\n"
+        "🏀 `баскетбол 100к`\n"
+        "🎳 `боулинг 100к`\n"
+        "🎯 `дартс 100к`\n"
+        "🎰 `слоты 100к`\n"
+        "🃏 `бд 100к`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="help_back")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "help_systems")
+async def help_systems(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "💼 **СИСТЕМЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 `я` — профиль\n"
+        "💼 `работа` — заработок\n"
+        "⛏️ `ферма` — добыча VT\n"
+        "🛒 `рынок` — торговля VT\n"
+        "🏦 `банк` — депозит и переводы\n"
+        "🏆 `топ` — рейтинги\n"
+        "🎁 `промо КОД` — промокод\n\n"
+        "⭐ За действия иногда даётся XP\n"
+        "📈 25% шанс получить 1-2 XP",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="help_back")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "help_president")
+async def help_president_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "👑 **ПРЕЗИДЕНТ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        "• Налог 0.01% от операций\n"
+        "• Ставки: 00:10 - 23:59 МСК\n"
+        "• Итоги: 00:07 МСК\n"
+        "• Победитель — случайный среди участников\n"
+        "• Проигравшим 50% возврат\n"
+        "• Президент не участвует в своих выборах\n\n"
+        "Команда: `президент`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="help_back")]
+        ])
+    )
+
+
+@router.callback_query(F.data == "help_back")
+async def help_back(callback: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Игры", callback_data="help_games")],
+        [InlineKeyboardButton(text="💼 Системы", callback_data="help_systems")],
+        [InlineKeyboardButton(text="👑 Президент", callback_data="help_president")]
+    ])
+
+    await callback.message.edit_text(
+        "🎮 **VIBEBOT**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Добро пожаловать!\n"
+        "Выбери раздел помощи:",
+        reply_markup=keyboard
+    )
