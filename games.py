@@ -4,7 +4,7 @@ import json
 from aiogram import Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from database import db
-from utils import format_number, parse_amount
+from utils import format_num, parse_amount, maybe_give_xp
 
 games_router = Router()
 
@@ -12,11 +12,8 @@ games_router = Router()
 # ==================== МИНЫ ====================
 
 class MinesGame:
-    """Мины - поле 5x5, от 1 до 6 мин"""
-    
     @staticmethod
     def calculate_multiplier(opened: int, mines_count: int) -> float:
-        """Расчёт множителя"""
         multipliers = {
             1: {1: 1.09, 2: 1.18, 3: 1.29, 4: 1.41, 5: 1.56, 6: 1.74},
             2: {1: 1.19, 2: 1.40, 3: 1.66, 4: 2.00, 5: 2.44, 6: 3.03},
@@ -29,9 +26,7 @@ class MinesGame:
             9: {1: 2.24, 2: 4.60, 3: 9.85, 4: 22.52, 5: 55.01, 6: 145.49},
             10: {1: 2.46, 2: 5.47, 3: 12.71, 4: 31.86, 5: 85.86, 6: 252.85},
         }
-        if opened in multipliers and mines_count in multipliers[opened]:
-            return multipliers[opened][mines_count]
-        return 1.0
+        return multipliers.get(opened, {}).get(mines_count, 1.0)
     
     @staticmethod
     def create_keyboard(session_id: int, opened: list, mines: list, game_over: bool = False):
@@ -41,86 +36,66 @@ class MinesGame:
             for col in range(5):
                 cell = row * 5 + col
                 if game_over:
-                    if cell in mines:
-                        text = "💣"
-                    elif cell in opened:
-                        text = "💎"
-                    else:
-                        text = "◻️"
-                    callback = "game_disabled"
+                    text = "💣" if cell in mines else ("💎" if cell in opened else "⬜")
+                    callback = "disabled"
                 elif cell in opened:
                     text = "💎"
-                    callback = "game_disabled"
+                    callback = "disabled"
                 else:
-                    text = "◻️"
+                    text = "🟦"
                     callback = f"mines_{session_id}_{cell}"
                 row_buttons.append(InlineKeyboardButton(text=text, callback_data=callback))
             keyboard.append(row_buttons)
         return keyboard
 
 
-@games_router.message(lambda m: m.text and (m.text.lower().startswith('мины') or m.text.lower().startswith('/mines')))
+@games_router.message(lambda m: m.text and m.text.lower().startswith('мины'))
 async def mines_start(message: Message):
-    text = message.text.lower().replace('/mines', '').replace('мины', '').strip()
+    text = message.text.lower().replace('мины', '').strip()
     parts = text.split()
     
     if len(parts) < 1:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Что это?", callback_data="info_mines")]
+        ])
         await message.answer(
-            f"ℹ️ **Мины** — это игра, в которой вам нужно угадать пустые ячейки. "
-            f"Чем больше ячеек вы откроете, тем больше получите VC!\n\n"
-            f"🤖 Чтобы начать игру, используй команду:\n\n"
-            f"💣 `мины [ставка] [мины 1-6]`\n\n"
-            f"Пример: `мины 100 6`\n"
-            f"Пример: `мины 100`"
+            "💣 **МИНЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🎮 `мины [ставка] [мины 1-6]`\n\n"
+            "📝 Пример: `мины 100к 5`",
+            reply_markup=keyboard
         )
         return
     
     user = await db.get_user(message.from_user.id)
     if not user:
-        await message.answer("❌ Сначала напиши /start")
         return
     
     bet = parse_amount(parts[0], user['coins'])
-    mines_count = 3
-    if len(parts) >= 2:
-        try:
-            mines_count = int(parts[1])
-            if mines_count < 1 or mines_count > 6:
-                await message.answer("❌ Количество мин: от 1 до 6")
-                return
-        except:
-            pass
+    mines_count = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() and 1 <= int(parts[1]) <= 6 else 3
     
-    if bet <= 0:
-        await message.answer("❌ Укажи ставку!")
-        return
-    if bet > user['coins']:
-        await message.answer(f"❌ Недостаточно монет!")
+    if bet <= 0 or bet > user['coins']:
+        await message.answer("❌ Некорректная ставка!")
         return
     
     await db.update_coins(message.from_user.id, -bet)
     
-    all_cells = list(range(25))
-    mines = random.sample(all_cells, mines_count)
+    xp = maybe_give_xp()
+    if xp > 0:
+        await db.add_xp(message.from_user.id, xp)
     
+    mines = random.sample(range(25), mines_count)
     state = {'mines': mines, 'opened': [], 'mines_count': mines_count, 'bet': bet}
     session_id = await db.create_game_session(message.from_user.id, 'mines', bet, state)
     
     keyboard_rows = MinesGame.create_keyboard(session_id, [], mines, False)
-    keyboard_rows.append([
-        InlineKeyboardButton(text="🎲 Случайная ячейка", callback_data=f"mines_random_{session_id}")
-    ])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    keyboard_rows.append([InlineKeyboardButton(text="🎲 Случайно", callback_data=f"mines_random_{session_id}")])
     
     await message.answer(
-        f"💣 **МИНЫ**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n"
-        f"💣 Мин: **{mines_count}**\n\n"
-        f"✨ Открыто: **0**\n"
-        f"📈 Множитель: **x1.00**\n\n"
+        f"💣 **МИНЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Ставка: **{format_num(bet)}** VC\n"
+        f"💣 Мин: **{mines_count}** | 📈 x**1.00**\n\n"
         f"🎯 Выбери ячейку!",
-        reply_markup=keyboard
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     )
 
 
@@ -137,36 +112,25 @@ async def mines_callback(callback: CallbackQuery):
         
         state = json.loads(session['state'])
         available = [i for i in range(25) if i not in state['opened'] and i not in state['mines']]
-        
         if not available:
-            await callback.answer("❌ Нет доступных ячеек!", show_alert=True)
+            await callback.answer("❌ Нет ячеек!", show_alert=True)
             return
         
         cell = random.choice(available)
         state['opened'].append(cell)
-        opened_count = len(state['opened'])
-        mult = MinesGame.calculate_multiplier(opened_count, state['mines_count'])
-        
+        mult = MinesGame.calculate_multiplier(len(state['opened']), state['mines_count'])
         await db.update_game_session(session_id, state, True)
         
         keyboard_rows = MinesGame.create_keyboard(session_id, state['opened'], state['mines'], False)
-        potential_win = int(state['bet'] * mult)
-        keyboard_rows.append([
-            InlineKeyboardButton(text=f"💰 Забрать {format_number(potential_win)} VC", callback_data=f"mines_cashout_{session_id}")
-        ])
-        keyboard_rows.append([
-            InlineKeyboardButton(text="🎲 Случайная", callback_data=f"mines_random_{session_id}")
-        ])
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+        win = int(state['bet'] * mult)
+        keyboard_rows.append([InlineKeyboardButton(text=f"💰 Забрать {format_num(win)}", callback_data=f"mines_cashout_{session_id}")])
+        keyboard_rows.append([InlineKeyboardButton(text="🎲 Случайно", callback_data=f"mines_random_{session_id}")])
         
         await callback.message.edit_text(
             f"💣 **МИНЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💰 Ставка: **{format_number(state['bet'])} VC**\n"
-            f"💣 Мин: **{state['mines_count']}**\n\n"
-            f"✨ Открыто: **{opened_count}**\n"
-            f"📈 Множитель: **x{mult:.2f}**\n"
-            f"💵 Выигрыш: **{format_number(potential_win)} VC**",
-            reply_markup=keyboard
+            f"💰 **{format_num(state['bet'])}** VC | 📈 x**{mult:.2f}**\n"
+            f"💵 Забрать: **{format_num(win)}** VC",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         )
         await callback.answer("✅ Безопасно!")
         return
@@ -179,34 +143,27 @@ async def mines_callback(callback: CallbackQuery):
             return
         
         state = json.loads(session['state'])
-        opened_count = len(state['opened'])
-        
-        if opened_count == 0:
-            await callback.answer("❌ Сначала открой хотя бы одну ячейку!", show_alert=True)
+        if len(state['opened']) == 0:
+            await callback.answer("❌ Открой хотя бы 1 ячейку!", show_alert=True)
             return
         
-        mult = MinesGame.calculate_multiplier(opened_count, state['mines_count'])
-        winnings = int(state['bet'] * mult)
+        mult = MinesGame.calculate_multiplier(len(state['opened']), state['mines_count'])
+        win = int(state['bet'] * mult)
         
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        await db.close_game_session(session_id, "cashout", winnings)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await db.close_game_session(session_id)
         
         keyboard_rows = MinesGame.create_keyboard(session_id, state['opened'], state['mines'], True)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         
         await callback.message.edit_text(
-            f"💣 **МИНЫ - ПОБЕДА!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ Забрал выигрыш!\n"
-            f"✨ Открыто: **{opened_count}** ячеек\n"
-            f"📈 Множитель: **x{mult:.2f}**\n\n"
-            f"🏆 Выигрыш: **{format_number(winnings)} VC**",
-            reply_markup=keyboard
+            f"💣 **МИНЫ — ПОБЕДА!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ Открыто: **{len(state['opened'])}** | 📈 x**{mult:.2f}**\n\n"
+            f"🏆 **+{format_num(win)}** VC",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         )
-        await callback.answer(f"💰 +{format_number(winnings)} VC!", show_alert=True)
         return
     
-    # Открытие ячейки
     session_id = int(parts[1])
     cell = int(parts[2])
     
@@ -218,65 +175,52 @@ async def mines_callback(callback: CallbackQuery):
     state = json.loads(session['state'])
     
     if cell in state['mines']:
-        state['opened'].append(cell)
         await db.update_stats(callback.from_user.id, False, state['bet'])
-        await db.close_game_session(session_id, "loss", 0)
+        await db.close_game_session(session_id)
+        state['opened'].append(cell)
         
         keyboard_rows = MinesGame.create_keyboard(session_id, state['opened'], state['mines'], True)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         
         await callback.message.edit_text(
-            f"💣 **МИНЫ - ВЗРЫВ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💣 **МИНЫ — ВЗРЫВ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
             f"💥 Попал на мину!\n\n"
-            f"💔 Проигрыш: **{format_number(state['bet'])} VC**",
-            reply_markup=keyboard
+            f"💔 **-{format_num(state['bet'])}** VC",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         )
         await callback.answer("💥 ВЗРЫВ!", show_alert=True)
         return
     
     state['opened'].append(cell)
-    opened_count = len(state['opened'])
-    mult = MinesGame.calculate_multiplier(opened_count, state['mines_count'])
+    mult = MinesGame.calculate_multiplier(len(state['opened']), state['mines_count'])
     
-    if opened_count >= (25 - state['mines_count']):
-        winnings = int(state['bet'] * mult)
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        await db.close_game_session(session_id, "win", winnings)
+    if len(state['opened']) >= (25 - state['mines_count']):
+        win = int(state['bet'] * mult)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await db.close_game_session(session_id)
         
         keyboard_rows = MinesGame.create_keyboard(session_id, state['opened'], state['mines'], True)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         
         await callback.message.edit_text(
-            f"💣 **МИНЫ - ДЖЕКПОТ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎉 Все ячейки открыты!\n"
-            f"📈 Множитель: **x{mult:.2f}**\n\n"
-            f"🏆 Выигрыш: **{format_number(winnings)} VC**",
-            reply_markup=keyboard
+            f"💣 **МИНЫ — ДЖЕКПОТ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🎉 Все ячейки!\n\n"
+            f"🏆 **+{format_num(win)}** VC",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         )
-        await callback.answer(f"🎉 ДЖЕКПОТ!", show_alert=True)
         return
     
     await db.update_game_session(session_id, state, True)
     
     keyboard_rows = MinesGame.create_keyboard(session_id, state['opened'], state['mines'], False)
-    potential_win = int(state['bet'] * mult)
-    keyboard_rows.append([
-        InlineKeyboardButton(text=f"💰 Забрать {format_number(potential_win)} VC", callback_data=f"mines_cashout_{session_id}")
-    ])
-    keyboard_rows.append([
-        InlineKeyboardButton(text="🎲 Случайная", callback_data=f"mines_random_{session_id}")
-    ])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    win = int(state['bet'] * mult)
+    keyboard_rows.append([InlineKeyboardButton(text=f"💰 Забрать {format_num(win)}", callback_data=f"mines_cashout_{session_id}")])
+    keyboard_rows.append([InlineKeyboardButton(text="🎲 Случайно", callback_data=f"mines_random_{session_id}")])
     
     await callback.message.edit_text(
         f"💣 **МИНЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(state['bet'])} VC**\n"
-        f"💣 Мин: **{state['mines_count']}**\n\n"
-        f"✨ Открыто: **{opened_count}**\n"
-        f"📈 Множитель: **x{mult:.2f}**\n"
-        f"💵 Выигрыш: **{format_number(potential_win)} VC**",
-        reply_markup=keyboard
+        f"💰 **{format_num(state['bet'])}** VC | 📈 x**{mult:.2f}**\n"
+        f"💵 Забрать: **{format_num(win)}** VC",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     )
     await callback.answer("✅ Безопасно!")
 
@@ -285,20 +229,11 @@ async def mines_callback(callback: CallbackQuery):
 
 class DiamondsGame:
     @staticmethod
-    def get_field_size(level: int, difficulty: int) -> int:
-        if difficulty == 1:
-            return 3
-        else:
-            return 4
-    
-    @staticmethod
     def get_multiplier(level: int, difficulty: int) -> float:
         if difficulty == 1:
-            mults = {1: 1.08, 2: 1.17, 3: 1.27, 4: 1.38, 5: 1.50, 6: 1.63, 7: 1.77, 8: 1.92,
-                     9: 2.09, 10: 2.27, 11: 2.47, 12: 2.68, 13: 2.92, 14: 3.17, 15: 3.45, 16: 3.75}
+            mults = {1: 1.08, 2: 1.17, 3: 1.27, 4: 1.38, 5: 1.50, 6: 1.63, 7: 1.77, 8: 1.92, 9: 2.09, 10: 2.27, 11: 2.47, 12: 2.68, 13: 2.92, 14: 3.17, 15: 3.45, 16: 3.75}
         else:
-            mults = {1: 1.13, 2: 1.28, 3: 1.45, 4: 1.64, 5: 1.86, 6: 2.11, 7: 2.39, 8: 2.71,
-                     9: 3.07, 10: 3.48, 11: 3.95, 12: 4.48, 13: 5.08, 14: 5.76, 15: 6.53, 16: 7.41}
+            mults = {1: 1.13, 2: 1.28, 3: 1.45, 4: 1.64, 5: 1.86, 6: 2.11, 7: 2.39, 8: 2.71, 9: 3.07, 10: 3.48, 11: 3.95, 12: 4.48, 13: 5.08, 14: 5.76, 15: 6.53, 16: 7.41}
         return mults.get(level, 1.0)
     
     @staticmethod
@@ -309,84 +244,63 @@ class DiamondsGame:
             for col in range(size):
                 cell = row * size + col
                 if game_over:
-                    if cell == diamond_pos:
-                        text = "💎"
-                    elif cell == chosen:
-                        text = "❌"
-                    else:
-                        text = "◻️"
-                    callback = "game_disabled"
+                    text = "💎" if cell == diamond_pos else ("❌" if cell == chosen else "⬜")
+                    callback = "disabled"
                 else:
-                    text = "◻️"
+                    text = "🟦"
                     callback = f"diamond_{session_id}_{cell}"
                 row_buttons.append(InlineKeyboardButton(text=text, callback_data=callback))
             keyboard.append(row_buttons)
         return keyboard
 
 
-@games_router.message(lambda m: m.text and (m.text.lower().startswith('алмаз') or m.text.lower().startswith('/diamond')))
+@games_router.message(lambda m: m.text and m.text.lower().startswith('алмаз'))
 async def diamond_start(message: Message):
-    text = message.text.lower().replace('/diamond', '').replace('алмазы', '').replace('алмаз', '').strip()
+    text = message.text.lower().replace('алмазы', '').replace('алмаз', '').strip()
     parts = text.split()
     
     if len(parts) < 1:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Что это?", callback_data="info_diamond")]
+        ])
         await message.answer(
-            f"ℹ️ **Алмазная лихорадка** — это игра, в которой необходимо угадать, "
-            f"в какой ячейке спрятан алмаз. Вам нужно открывать по одной ячейке на "
-            f"каждом из 16 уровней, чтобы найти алмаз.\n\n"
-            f"🤖 Чтобы начать игру, используй команду:\n\n"
-            f"💠 `алмазы [ставка] [сложность 1-2]`\n\n"
-            f"Пример: `алмазы 100 2`\n"
-            f"Пример: `алмазы 100`"
+            "💎 **АЛМАЗЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🎮 `алмазы [ставка] [сложность 1-2]`\n\n"
+            "📝 Пример: `алмазы 100к 2`",
+            reply_markup=keyboard
         )
         return
     
     user = await db.get_user(message.from_user.id)
     if not user:
-        await message.answer("❌ Сначала напиши /start")
         return
     
     bet = parse_amount(parts[0], user['coins'])
-    difficulty = 1
-    if len(parts) >= 2:
-        try:
-            difficulty = int(parts[1])
-            if difficulty < 1 or difficulty > 2:
-                await message.answer("❌ Сложность: 1 или 2")
-                return
-        except:
-            pass
+    difficulty = int(parts[1]) if len(parts) >= 2 and parts[1] in ['1', '2'] else 1
     
-    if bet <= 0:
-        await message.answer("❌ Укажи ставку!")
-        return
-    if bet > user['coins']:
-        await message.answer(f"❌ Недостаточно монет!")
+    if bet <= 0 or bet > user['coins']:
+        await message.answer("❌ Некорректная ставка!")
         return
     
     await db.update_coins(message.from_user.id, -bet)
     
-    level = 1
-    size = DiamondsGame.get_field_size(level, difficulty)
-    diamond_pos = random.randint(0, size * size - 1)
+    xp = maybe_give_xp()
+    if xp > 0:
+        await db.add_xp(message.from_user.id, xp)
     
-    state = {'level': level, 'difficulty': difficulty, 'bet': bet, 'size': size, 'diamond_pos': diamond_pos}
+    size = 3 if difficulty == 1 else 4
+    diamond_pos = random.randint(0, size * size - 1)
+    state = {'level': 1, 'difficulty': difficulty, 'bet': bet, 'size': size, 'diamond_pos': diamond_pos}
     session_id = await db.create_game_session(message.from_user.id, 'diamonds', bet, state)
     
     keyboard_rows = DiamondsGame.create_keyboard(session_id, size, diamond_pos, False)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-    
-    mult = DiamondsGame.get_multiplier(level, difficulty)
-    potential = int(bet * mult)
+    mult = DiamondsGame.get_multiplier(1, difficulty)
     
     await message.answer(
-        f"💎 **АЛМАЗЫ** — Уровень {level}/16\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n"
-        f"📊 Сложность: **{difficulty}** ({'3x3' if difficulty == 1 else '4x4'})\n\n"
-        f"📈 Множитель: **x{mult:.2f}**\n"
-        f"💵 Потенциал: **{format_number(potential)} VC**\n\n"
+        f"💎 **АЛМАЗЫ** — Уровень 1/16\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 **{format_num(bet)}** VC | 📈 x**{mult:.2f}**\n\n"
         f"🔍 Найди алмаз!",
-        reply_markup=keyboard
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     )
 
 
@@ -403,23 +317,21 @@ async def diamond_callback(callback: CallbackQuery):
         
         state = json.loads(session['state'])
         if state['level'] <= 1:
-            await callback.answer("❌ Сначала пройди хотя бы один уровень!", show_alert=True)
+            await callback.answer("❌ Пройди хотя бы 1 уровень!", show_alert=True)
             return
         
         mult = DiamondsGame.get_multiplier(state['level'] - 1, state['difficulty'])
-        winnings = int(state['bet'] * mult)
+        win = int(state['bet'] * mult)
         
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        await db.close_game_session(session_id, "cashout", winnings)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await db.close_game_session(session_id)
         
         await callback.message.edit_text(
-            f"💎 **АЛМАЗЫ - ЗАБРАЛ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ Пройдено уровней: **{state['level'] - 1}/16**\n"
-            f"📈 Множитель: **x{mult:.2f}**\n\n"
-            f"🏆 Выигрыш: **{format_number(winnings)} VC**"
+            f"💎 **АЛМАЗЫ — ЗАБРАЛ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ Уровней: **{state['level'] - 1}** | 📈 x**{mult:.2f}**\n\n"
+            f"🏆 **+{format_num(win)}** VC"
         )
-        await callback.answer(f"💰 +{format_number(winnings)} VC!", show_alert=True)
         return
     
     session_id = int(parts[1])
@@ -434,17 +346,15 @@ async def diamond_callback(callback: CallbackQuery):
     
     if cell != state['diamond_pos']:
         await db.update_stats(callback.from_user.id, False, state['bet'])
-        await db.close_game_session(session_id, "loss", 0)
+        await db.close_game_session(session_id)
         
         keyboard_rows = DiamondsGame.create_keyboard(session_id, state['size'], state['diamond_pos'], True, cell)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         
         await callback.message.edit_text(
-            f"💎 **АЛМАЗЫ - ПРОИГРЫШ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"❌ Не угадал!\n"
-            f"🎯 Пройдено: **{state['level'] - 1}/16**\n\n"
-            f"💔 Проигрыш: **{format_number(state['bet'])} VC**",
-            reply_markup=keyboard
+            f"💎 **АЛМАЗЫ — ПРОИГРЫШ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"❌ Не угадал!\n\n"
+            f"💔 **-{format_num(state['bet'])}** VC",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         )
         await callback.answer("❌ Не угадал!", show_alert=True)
         return
@@ -453,46 +363,35 @@ async def diamond_callback(callback: CallbackQuery):
     
     if state['level'] > 16:
         mult = DiamondsGame.get_multiplier(16, state['difficulty'])
-        winnings = int(state['bet'] * mult)
+        win = int(state['bet'] * mult)
         
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        await db.close_game_session(session_id, "win", winnings)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await db.close_game_session(session_id)
         
         await callback.message.edit_text(
-            f"💎 **АЛМАЗЫ - ДЖЕКПОТ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎉 Прошёл все 16 уровней!\n"
-            f"📈 Множитель: **x{mult:.2f}**\n\n"
-            f"🏆 ДЖЕКПОТ: **{format_number(winnings)} VC**"
+            f"💎 **АЛМАЗЫ — ДЖЕКПОТ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🎉 Все 16 уровней!\n\n"
+            f"🏆 **+{format_num(win)}** VC"
         )
-        await callback.answer(f"🎉 ДЖЕКПОТ!", show_alert=True)
         return
     
-    size = DiamondsGame.get_field_size(state['level'], state['difficulty'])
-    state['size'] = size
-    state['diamond_pos'] = random.randint(0, size * size - 1)
-    
+    state['size'] = 3 if state['difficulty'] == 1 else 4
+    state['diamond_pos'] = random.randint(0, state['size'] * state['size'] - 1)
     await db.update_game_session(session_id, state, True)
     
-    keyboard_rows = DiamondsGame.create_keyboard(session_id, size, state['diamond_pos'], False)
+    keyboard_rows = DiamondsGame.create_keyboard(session_id, state['size'], state['diamond_pos'], False)
     prev_mult = DiamondsGame.get_multiplier(state['level'] - 1, state['difficulty'])
     prev_win = int(state['bet'] * prev_mult)
-    keyboard_rows.append([
-        InlineKeyboardButton(text=f"💰 Забрать {format_number(prev_win)} VC (x{prev_mult:.2f})", callback_data=f"diamond_cashout_{session_id}")
-    ])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    keyboard_rows.append([InlineKeyboardButton(text=f"💰 Забрать {format_num(prev_win)}", callback_data=f"diamond_cashout_{session_id}")])
     
     curr_mult = DiamondsGame.get_multiplier(state['level'], state['difficulty'])
-    potential = int(state['bet'] * curr_mult)
     
     await callback.message.edit_text(
         f"💎 **АЛМАЗЫ** — Уровень {state['level']}/16\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"✅ Нашёл алмаз!\n"
-        f"💰 Ставка: **{format_number(state['bet'])} VC**\n\n"
-        f"📈 Множитель: **x{curr_mult:.2f}**\n"
-        f"💵 Потенциал: **{format_number(potential)} VC**\n\n"
+        f"✅ Угадал! 📈 x**{curr_mult:.2f}**\n\n"
         f"🔍 Найди алмаз!",
-        reply_markup=keyboard
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     )
     await callback.answer("✅ Угадал!")
 
@@ -505,56 +404,48 @@ async def roulette_start(message: Message):
     parts = text.split()
     
     if len(parts) < 1:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Что это?", callback_data="info_roulette")]
+        ])
         await message.answer(
-            f"🎡 **РУЛЕТКА**\n\n"
-            f"🎮 Использование: `рулетка [ставка]`\n\n"
-            f"Пример: `рулетка 100`\n"
-            f"Пример: `рулетка 100к`"
+            "🎡 **РУЛЕТКА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🎮 `рулетка [ставка]`\n\n"
+            "📝 Пример: `рулетка 100к`",
+            reply_markup=keyboard
         )
         return
     
     user = await db.get_user(message.from_user.id)
     if not user:
-        await message.answer("❌ Сначала напиши /start")
         return
     
     bet = parse_amount(parts[0], user['coins'])
-    
-    if bet <= 0:
-        await message.answer("❌ Укажи ставку!")
-        return
-    if bet > user['coins']:
-        await message.answer(f"❌ Недостаточно монет!")
+    if bet <= 0 or bet > user['coins']:
+        await message.answer("❌ Некорректная ставка!")
         return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🔴 Красное x2", callback_data=f"roulette_{bet}_red"),
-            InlineKeyboardButton(text="⚫ Чёрное x2", callback_data=f"roulette_{bet}_black"),
+            InlineKeyboardButton(text="🔴 Красное x2", callback_data=f"rlt_{bet}_red"),
+            InlineKeyboardButton(text="⚫ Чёрное x2", callback_data=f"rlt_{bet}_black"),
         ],
+        [InlineKeyboardButton(text="🟢 Зеро x36", callback_data=f"rlt_{bet}_zero")],
         [
-            InlineKeyboardButton(text="🟢 Зеро x36", callback_data=f"roulette_{bet}_zero"),
-        ],
-        [
-            InlineKeyboardButton(text="1-12 x3", callback_data=f"roulette_{bet}_1-12"),
-            InlineKeyboardButton(text="13-24 x3", callback_data=f"roulette_{bet}_13-24"),
-            InlineKeyboardButton(text="25-36 x3", callback_data=f"roulette_{bet}_25-36"),
+            InlineKeyboardButton(text="1-12 x3", callback_data=f"rlt_{bet}_1-12"),
+            InlineKeyboardButton(text="13-24 x3", callback_data=f"rlt_{bet}_13-24"),
+            InlineKeyboardButton(text="25-36 x3", callback_data=f"rlt_{bet}_25-36"),
         ]
     ])
     
     await message.answer(
         f"🎡 **РУЛЕТКА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n\n"
-        f"🎯 Выбери ставку:\n\n"
-        f"🔴 **Красное** — x2\n"
-        f"⚫ **Чёрное** — x2\n"
-        f"🟢 **Зеро (0)** — x36\n"
-        f"📊 **1-12 / 13-24 / 25-36** — x3",
+        f"💰 Ставка: **{format_num(bet)}** VC\n\n"
+        f"🎯 Выбери ставку:",
         reply_markup=keyboard
     )
 
 
-@games_router.callback_query(lambda c: c.data.startswith('roulette_'))
+@games_router.callback_query(lambda c: c.data.startswith('rlt_'))
 async def roulette_callback(callback: CallbackQuery):
     parts = callback.data.split('_')
     bet = int(parts[1])
@@ -562,68 +453,39 @@ async def roulette_callback(callback: CallbackQuery):
     
     user = await db.get_user(callback.from_user.id)
     if user['coins'] < bet:
-        await callback.answer("❌ Недостаточно монет!", show_alert=True)
+        await callback.answer("❌ Нет денег!", show_alert=True)
         return
     
     await db.update_coins(callback.from_user.id, -bet)
     
-    await callback.message.edit_text(f"🎡 **РУЛЕТКА**\n\n🎰 Крутим колесо... 🌀")
+    xp = maybe_give_xp()
+    if xp > 0:
+        await db.add_xp(callback.from_user.id, xp)
     
+    await callback.message.edit_text("🎡 **РУЛЕТКА**\n\n🎰 Крутим...")
     await asyncio.sleep(2)
     
     result = random.randint(0, 36)
-    
     RED = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
-    BLACK = [2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35]
     
-    if result == 0:
-        color_emoji = "🟢"
-        color_name = "Зеро"
-    elif result in RED:
-        color_emoji = "🔴"
-        color_name = "Красное"
-    else:
-        color_emoji = "⚫"
-        color_name = "Чёрное"
+    color = "🟢" if result == 0 else ("🔴" if result in RED else "⚫")
     
-    won = False
-    mult = 0
-    
-    if choice == "red" and result in RED:
-        won, mult = True, 2
-    elif choice == "black" and result in BLACK:
-        won, mult = True, 2
-    elif choice == "zero" and result == 0:
-        won, mult = True, 36
-    elif choice == "1-12" and 1 <= result <= 12:
-        won, mult = True, 3
-    elif choice == "13-24" and 13 <= result <= 24:
-        won, mult = True, 3
-    elif choice == "25-36" and 25 <= result <= 36:
-        won, mult = True, 3
+    won, mult = False, 0
+    if choice == "red" and result in RED: won, mult = True, 2
+    elif choice == "black" and result not in RED and result != 0: won, mult = True, 2
+    elif choice == "zero" and result == 0: won, mult = True, 36
+    elif choice == "1-12" and 1 <= result <= 12: won, mult = True, 3
+    elif choice == "13-24" and 13 <= result <= 24: won, mult = True, 3
+    elif choice == "25-36" and 25 <= result <= 36: won, mult = True, 3
     
     if won:
-        winnings = bet * mult
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        
-        text = (
-            f"🎡 **РУЛЕТКА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎰 Выпало: {color_emoji} **{result}** ({color_name})\n\n"
-            f"✅ **ПОБЕДА!**\n"
-            f"📈 Множитель: **x{mult}**\n"
-            f"💰 Выигрыш: **{format_number(winnings)} VC**"
-        )
+        win = bet * mult
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await callback.message.edit_text(f"🎡 **РУЛЕТКА**\n━━━━━━━━━━━━━━━━━━━━\n\n{color} Выпало: **{result}**\n\n✅ x{mult} | 🏆 **+{format_num(win)}** VC")
     else:
         await db.update_stats(callback.from_user.id, False, bet)
-        text = (
-            f"🎡 **РУЛЕТКА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎰 Выпало: {color_emoji} **{result}** ({color_name})\n\n"
-            f"❌ **ПРОИГРЫШ**\n"
-            f"💔 Потеряно: **{format_number(bet)} VC**"
-        )
-    
-    await callback.message.edit_text(text)
+        await callback.message.edit_text(f"🎡 **РУЛЕТКА**\n━━━━━━━━━━━━━━━━━━━━\n\n{color} Выпало: **{result}**\n\n❌ **-{format_num(bet)}** VC")
 
 
 # ==================== КРАШ ====================
@@ -634,109 +496,71 @@ async def crash_start(message: Message):
     parts = text.split()
     
     if len(parts) < 2:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Что это?", callback_data="info_crash")]
+        ])
         await message.answer(
-            f"📈 **КРАШ**\n\n"
-            f"🎮 Использование: `краш [ставка] [вывод]`\n\n"
-            f"Пример: `краш 100 2.5`\n"
-            f"Пример: `краш 1к 10`\n\n"
-            f"📊 Множитель вывода: от 1.01 до 505"
+            "📈 **КРАШ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🎮 `краш [ставка] [вывод]`\n\n"
+            "📝 Пример: `краш 100к 2.5`",
+            reply_markup=keyboard
         )
         return
     
     user = await db.get_user(message.from_user.id)
     if not user:
-        await message.answer("❌ Сначала напиши /start")
         return
     
     bet = parse_amount(parts[0], user['coins'])
-    
     try:
-        cashout_at = float(parts[1].replace('x', '').replace(',', '.'))
+        cashout = float(parts[1].replace('x', '').replace(',', '.'))
     except:
         await message.answer("❌ Некорректный множитель!")
         return
     
-    if bet <= 0:
-        await message.answer("❌ Укажи ставку!")
+    if bet <= 0 or bet > user['coins']:
+        await message.answer("❌ Некорректная ставка!")
         return
-    if bet > user['coins']:
-        await message.answer(f"❌ Недостаточно монет!")
-        return
-    if cashout_at < 1.01 or cashout_at > 505:
-        await message.answer("❌ Множитель от 1.01 до 505!")
+    if cashout < 1.01 or cashout > 505:
+        await message.answer("❌ Множитель: 1.01 - 505!")
         return
     
     await db.update_coins(message.from_user.id, -bet)
     
-    # Генерация точки краша
-    rand = random.random()
-    if rand < 0.33:
-        crash_point = round(random.uniform(1.0, 1.5), 2)
-    elif rand < 0.55:
-        crash_point = round(random.uniform(1.5, 2.5), 2)
-    elif rand < 0.75:
-        crash_point = round(random.uniform(2.5, 5.0), 2)
-    elif rand < 0.90:
-        crash_point = round(random.uniform(5.0, 20.0), 2)
-    elif rand < 0.98:
-        crash_point = round(random.uniform(20.0, 100.0), 2)
-    else:
-        crash_point = round(random.uniform(100.0, 505.0), 2)
+    xp = maybe_give_xp()
+    if xp > 0:
+        await db.add_xp(message.from_user.id, xp)
     
-    msg = await message.answer(
-        f"📈 **КРАШ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n"
-        f"🎯 Вывод на: **x{cashout_at}**\n\n"
-        f"🚀 Запуск... **x1.00**"
-    )
+    r = random.random()
+    if r < 0.4: crash_point = round(random.uniform(1.0, 1.5), 2)
+    elif r < 0.7: crash_point = round(random.uniform(1.5, 3.0), 2)
+    elif r < 0.9: crash_point = round(random.uniform(3.0, 10.0), 2)
+    else: crash_point = round(random.uniform(10.0, 100.0), 2)
+    
+    msg = await message.answer(f"📈 **КРАШ**\n━━━━━━━━━━━━━━━━━━━━\n\n💰 **{format_num(bet)}** VC → x**{cashout}**\n\n🚀 x**1.00**")
     
     current = 1.0
-    step = 0.03
-    
-    while current < min(crash_point, cashout_at + 0.5):
+    step = 0.05
+    while current < min(crash_point, cashout + 0.3):
         current = round(current + step, 2)
-        step = round(step * 1.05, 3)
-        
-        if current >= crash_point:
-            current = crash_point
-            break
-        
-        if current >= cashout_at:
-            break
-        
+        step *= 1.08
+        if current >= crash_point: break
+        if current >= cashout: break
+        bar_len = min(int((current / cashout) * 15), 15)
+        bar = "█" * bar_len + "░" * (15 - bar_len)
         try:
-            emoji = "🟢" if current < cashout_at * 0.7 else ("🟡" if current < cashout_at else "🔴")
-            await msg.edit_text(
-                f"📈 **КРАШ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"💰 Ставка: **{format_number(bet)} VC**\n"
-                f"🎯 Вывод на: **x{cashout_at}**\n\n"
-                f"{emoji} Текущий: **x{current}**"
-            )
-        except:
-            pass
-        
-        await asyncio.sleep(0.2)
+            await msg.edit_text(f"📈 **КРАШ**\n━━━━━━━━━━━━━━━━━━━━\n\n💰 **{format_num(bet)}** → x**{cashout}**\n\n🚀 x**{current}**\n[{bar}]")
+        except: pass
+        await asyncio.sleep(0.25)
     
-    if cashout_at <= crash_point:
-        winnings = int(bet * cashout_at)
-        await db.update_coins(message.from_user.id, winnings)
-        await db.update_stats(message.from_user.id, True, winnings)
-        
-        await msg.edit_text(
-            f"📈 **КРАШ - УСПЕХ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ Вывел на **x{cashout_at}**!\n"
-            f"💥 Крашнуло на: **x{crash_point}**\n\n"
-            f"🏆 Выигрыш: **{format_number(winnings)} VC**"
-        )
+    if cashout <= crash_point:
+        win = int(bet * cashout)
+        await db.update_coins(message.from_user.id, win)
+        await db.update_stats(message.from_user.id, True, win)
+        await msg.edit_text(f"📈 **КРАШ — УСПЕХ!**\n━━━━━━━━━━━━━━━━━━━━\n\n✅ x**{cashout}** | 💥 x**{crash_point}**\n\n🏆 **+{format_num(win)}** VC")
     else:
         await db.update_stats(message.from_user.id, False, bet)
-        
-        await msg.edit_text(
-            f"📈 **КРАШ - КРАХ!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💥 Крашнуло на: **x{crash_point}**\n"
-            f"🎯 Твой вывод: **x{cashout_at}**\n\n"
-            f"💔 Проигрыш: **{format_number(bet)} VC**"
-        )
+        await msg.edit_text(f"📈 **КРАШ — КРАХ!**\n━━━━━━━━━━━━━━━━━━━━\n\n💥 x**{crash_point}** | 🎯 x**{cashout}**\n\n💔 **-{format_num(bet)}** VC")
 
 
 # ==================== КОСТИ ====================
@@ -747,46 +571,26 @@ async def dice_start(message: Message):
     parts = text.split()
     
     if len(parts) < 1:
-        await message.answer(
-            f"🎲 **КОСТИ**\n\n"
-            f"🎮 Использование: `кости [ставка]`\n\n"
-            f"Пример: `кости 100`"
-        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Что это?", callback_data="info_dice")]
+        ])
+        await message.answer("🎲 **КОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎮 `кости [ставка]`\n\n📝 Пример: `кости 100к`", reply_markup=keyboard)
         return
     
     user = await db.get_user(message.from_user.id)
-    if not user:
-        await message.answer("❌ Сначала напиши /start")
-        return
+    if not user: return
     
     bet = parse_amount(parts[0], user['coins'])
-    
-    if bet <= 0:
-        await message.answer("❌ Укажи ставку!")
-        return
-    if bet > user['coins']:
-        await message.answer(f"❌ Недостаточно монет!")
+    if bet <= 0 or bet > user['coins']:
+        await message.answer("❌ Некорректная ставка!")
         return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📈 Больше 7 (x2.3)", callback_data=f"dice_{bet}_more"),
-            InlineKeyboardButton(text="📉 Меньше 7 (x2.3)", callback_data=f"dice_{bet}_less"),
-        ],
-        [
-            InlineKeyboardButton(text="🎯 Ровно 7 (x5.8)", callback_data=f"dice_{bet}_exact"),
-        ]
+        [InlineKeyboardButton(text="📈 Больше 7 (x2.3)", callback_data=f"dice_{bet}_more"), InlineKeyboardButton(text="📉 Меньше 7 (x2.3)", callback_data=f"dice_{bet}_less")],
+        [InlineKeyboardButton(text="🎯 Ровно 7 (x5.8)", callback_data=f"dice_{bet}_exact")]
     ])
     
-    await message.answer(
-        f"🎲 **КОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n\n"
-        f"🎯 Угадай сумму двух кубиков:\n\n"
-        f"📈 **Больше 7** — x2.3\n"
-        f"📉 **Меньше 7** — x2.3\n"
-        f"🎯 **Ровно 7** — x5.8",
-        reply_markup=keyboard
-    )
+    await message.answer(f"🎲 **КОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\n💰 Ставка: **{format_num(bet)}** VC\n\n🎯 Угадай сумму:", reply_markup=keyboard)
 
 
 @games_router.callback_query(lambda c: c.data.startswith('dice_'))
@@ -797,380 +601,498 @@ async def dice_callback(callback: CallbackQuery):
     
     user = await db.get_user(callback.from_user.id)
     if user['coins'] < bet:
-        await callback.answer("❌ Недостаточно монет!", show_alert=True)
+        await callback.answer("❌ Нет денег!", show_alert=True)
         return
     
     await db.update_coins(callback.from_user.id, -bet)
-    await callback.message.edit_text(f"🎲 **КОСТИ**\n\n🎰 Бросаем кубики...")
+    xp = maybe_give_xp()
+    if xp > 0: await db.add_xp(callback.from_user.id, xp)
     
-    dice1 = await callback.message.answer_dice(emoji="🎲")
+    await callback.message.edit_text("🎲 **КОСТИ**\n\n🎰 Бросаем...")
+    d1 = await callback.message.answer_dice(emoji="🎲")
     await asyncio.sleep(0.5)
-    dice2 = await callback.message.answer_dice(emoji="🎲")
-    
+    d2 = await callback.message.answer_dice(emoji="🎲")
     await asyncio.sleep(4)
     
-    total = dice1.dice.value + dice2.dice.value
+    total = d1.dice.value + d2.dice.value
     
-    won = False
-    mult = 0
-    
-    if choice == "more" and total > 7:
-        won, mult = True, 2.3
-    elif choice == "less" and total < 7:
-        won, mult = True, 2.3
-    elif choice == "exact" and total == 7:
-        won, mult = True, 5.8
-    
-    choice_text = {"more": "Больше 7", "less": "Меньше 7", "exact": "Ровно 7"}.get(choice)
+    won, mult = False, 0
+    if choice == "more" and total > 7: won, mult = True, 2.3
+    elif choice == "less" and total < 7: won, mult = True, 2.3
+    elif choice == "exact" and total == 7: won, mult = True, 5.8
     
     if won:
-        winnings = int(bet * mult)
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        
-        text = (
-            f"🎲 **КОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎯 Выпало: **{dice1.dice.value}** + **{dice2.dice.value}** = **{total}**\n"
-            f"📝 Ставка: **{choice_text}**\n\n"
-            f"✅ **ПОБЕДА!**\n"
-            f"📈 Множитель: **x{mult}**\n"
-            f"💰 Выигрыш: **{format_number(winnings)} VC**"
-        )
+        win = int(bet * mult)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await callback.message.answer(f"🎲 **КОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Сумма: **{total}**\n\n✅ x{mult} | 🏆 **+{format_num(win)}** VC")
     else:
         await db.update_stats(callback.from_user.id, False, bet)
-        text = (
-            f"🎲 **КОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎯 Выпало: **{dice1.dice.value}** + **{dice2.dice.value}** = **{total}**\n"
-            f"📝 Ставка: **{choice_text}**\n\n"
-            f"❌ **ПРОИГРЫШ**\n"
-            f"💔 Потеряно: **{format_number(bet)} VC**"
-        )
-    
-    await callback.message.answer(text)
+        await callback.message.answer(f"🎲 **КОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Сумма: **{total}**\n\n❌ **-{format_num(bet)}** VC")
 
 
-# ==================== ФУТБОЛ ====================
+# ==================== ФУТБОЛ, БАСКЕТБОЛ, БОУЛИНГ, ДАРТС ====================
 
 @games_router.message(lambda m: m.text and m.text.lower().startswith('футбол'))
 async def football_start(message: Message):
-    text = message.text.lower().replace('футбол', '').strip()
-    parts = text.split()
-    
+    parts = message.text.lower().replace('футбол', '').strip().split()
     if len(parts) < 1:
-        await message.answer(f"⚽ **ФУТБОЛ**\n\n🎮 Использование: `футбол [ставка]`\n\nПример: `футбол 100`")
+        await message.answer("⚽ **ФУТБОЛ**\n\n🎮 `футбол [ставка]`", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❓ Что это?", callback_data="info_football")]]))
         return
-    
     user = await db.get_user(message.from_user.id)
-    if not user:
-        await message.answer("❌ Сначала напиши /start")
-        return
-    
+    if not user: return
     bet = parse_amount(parts[0], user['coins'])
-    
     if bet <= 0 or bet > user['coins']:
         await message.answer("❌ Некорректная ставка!")
         return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⚽ Гол (x1.8)", callback_data=f"football_{bet}_goal"),
-            InlineKeyboardButton(text="❌ Мимо (x3.7)", callback_data=f"football_{bet}_miss"),
-        ]
-    ])
-    
-    await message.answer(
-        f"⚽ **ФУТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n\n"
-        f"🎯 Угадай результат:\n\n"
-        f"⚽ **Гол** — x1.8\n"
-        f"❌ **Мимо** — x3.7",
-        reply_markup=keyboard
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚽ Гол (x1.8)", callback_data=f"foot_{bet}_goal"), InlineKeyboardButton(text="❌ Мимо (x3.7)", callback_data=f"foot_{bet}_miss")]])
+    await message.answer(f"⚽ **ФУТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n💰 **{format_num(bet)}** VC\n\n🎯 Угадай:", reply_markup=keyboard)
 
 
-@games_router.callback_query(lambda c: c.data.startswith('football_'))
+@games_router.callback_query(lambda c: c.data.startswith('foot_'))
 async def football_callback(callback: CallbackQuery):
     parts = callback.data.split('_')
-    bet = int(parts[1])
-    choice = parts[2]
-    
+    bet, choice = int(parts[1]), parts[2]
     user = await db.get_user(callback.from_user.id)
     if user['coins'] < bet:
-        await callback.answer("❌ Недостаточно монет!", show_alert=True)
+        await callback.answer("❌ Нет денег!", show_alert=True)
         return
-    
     await db.update_coins(callback.from_user.id, -bet)
-    await callback.message.edit_text(f"⚽ **ФУТБОЛ**\n\n🏃 Удар...")
-    
+    xp = maybe_give_xp()
+    if xp > 0: await db.add_xp(callback.from_user.id, xp)
+    await callback.message.edit_text("⚽ **ФУТБОЛ**\n\n🏃 Удар...")
     dice = await callback.message.answer_dice(emoji="⚽")
     await asyncio.sleep(4)
-    
-    is_goal = dice.dice.value >= 3  # 3,4,5 - гол
+    is_goal = dice.dice.value >= 3
     won = (choice == "goal" and is_goal) or (choice == "miss" and not is_goal)
     mult = 1.8 if choice == "goal" else 3.7
-    
-    result_text = "⚽ ГОЛ!" if is_goal else "❌ Мимо!"
-    
+    result = "⚽ ГОЛ!" if is_goal else "❌ Мимо!"
     if won:
-        winnings = int(bet * mult)
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        
-        text = f"⚽ **ФУТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n✅ **ПОБЕДА!**\n📈 x{mult}\n💰 +**{format_number(winnings)} VC**"
+        win = int(bet * mult)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await callback.message.answer(f"⚽ **ФУТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result}\n\n✅ x{mult} | 🏆 **+{format_num(win)}** VC")
     else:
         await db.update_stats(callback.from_user.id, False, bet)
-        text = f"⚽ **ФУТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n❌ **ПРОИГРЫШ**\n💔 -{format_number(bet)} VC"
-    
-    await callback.message.answer(text)
+        await callback.message.answer(f"⚽ **ФУТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result}\n\n❌ **-{format_num(bet)}** VC")
 
-
-# ==================== БАСКЕТБОЛ ====================
 
 @games_router.message(lambda m: m.text and m.text.lower().startswith('баскетбол'))
 async def basketball_start(message: Message):
-    text = message.text.lower().replace('баскетбол', '').strip()
-    parts = text.split()
-    
+    parts = message.text.lower().replace('баскетбол', '').strip().split()
     if len(parts) < 1:
-        await message.answer(f"🏀 **БАСКЕТБОЛ**\n\n🎮 Использование: `баскетбол [ставка]`\n\nПример: `баскетбол 100`")
+        await message.answer("🏀 **БАСКЕТБОЛ**\n\n🎮 `баскетбол [ставка]`", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❓ Что это?", callback_data="info_basketball")]]))
         return
-    
     user = await db.get_user(message.from_user.id)
-    if not user:
-        await message.answer("❌ Сначала напиши /start")
-        return
-    
+    if not user: return
     bet = parse_amount(parts[0], user['coins'])
-    
     if bet <= 0 or bet > user['coins']:
         await message.answer("❌ Некорректная ставка!")
         return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🏀 Попал (x3.8)", callback_data=f"basketball_{bet}_goal"),
-            InlineKeyboardButton(text="❌ Мимо (x1.9)", callback_data=f"basketball_{bet}_miss"),
-        ]
-    ])
-    
-    await message.answer(
-        f"🏀 **БАСКЕТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n\n"
-        f"🎯 Угадай результат:\n\n"
-        f"🏀 **Попал** — x3.8\n"
-        f"❌ **Мимо** — x1.9",
-        reply_markup=keyboard
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏀 Попал (x3.8)", callback_data=f"bask_{bet}_goal"), InlineKeyboardButton(text="❌ Мимо (x1.9)", callback_data=f"bask_{bet}_miss")]])
+    await message.answer(f"🏀 **БАСКЕТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n💰 **{format_num(bet)}** VC\n\n🎯 Угадай:", reply_markup=keyboard)
 
 
-@games_router.callback_query(lambda c: c.data.startswith('basketball_'))
+@games_router.callback_query(lambda c: c.data.startswith('bask_'))
 async def basketball_callback(callback: CallbackQuery):
     parts = callback.data.split('_')
-    bet = int(parts[1])
-    choice = parts[2]
-    
+    bet, choice = int(parts[1]), parts[2]
     user = await db.get_user(callback.from_user.id)
     if user['coins'] < bet:
-        await callback.answer("❌ Недостаточно монет!", show_alert=True)
+        await callback.answer("❌ Нет денег!", show_alert=True)
         return
-    
     await db.update_coins(callback.from_user.id, -bet)
-    await callback.message.edit_text(f"🏀 **БАСКЕТБОЛ**\n\n🏃 Бросок...")
-    
+    xp = maybe_give_xp()
+    if xp > 0: await db.add_xp(callback.from_user.id, xp)
+    await callback.message.edit_text("🏀 **БАСКЕТБОЛ**\n\n🏃 Бросок...")
     dice = await callback.message.answer_dice(emoji="🏀")
     await asyncio.sleep(4)
-    
-    is_goal = dice.dice.value >= 4  # 4,5 - попал
+    is_goal = dice.dice.value >= 4
     won = (choice == "goal" and is_goal) or (choice == "miss" and not is_goal)
     mult = 3.8 if choice == "goal" else 1.9
-    
-    result_text = "🏀 Попал!" if is_goal else "❌ Мимо!"
-    
+    result = "🏀 Попал!" if is_goal else "❌ Мимо!"
     if won:
-        winnings = int(bet * mult)
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        
-        text = f"🏀 **БАСКЕТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n✅ **ПОБЕДА!**\n📈 x{mult}\n💰 +**{format_number(winnings)} VC**"
+        win = int(bet * mult)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await callback.message.answer(f"🏀 **БАСКЕТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result}\n\n✅ x{mult} | 🏆 **+{format_num(win)}** VC")
     else:
         await db.update_stats(callback.from_user.id, False, bet)
-        text = f"🏀 **БАСКЕТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n❌ **ПРОИГРЫШ**\n💔 -{format_number(bet)} VC"
-    
-    await callback.message.answer(text)
+        await callback.message.answer(f"🏀 **БАСКЕТБОЛ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result}\n\n❌ **-{format_num(bet)}** VC")
 
-
-# ==================== ДАРТС ====================
 
 @games_router.message(lambda m: m.text and m.text.lower().startswith('дартс'))
 async def darts_start(message: Message):
-    text = message.text.lower().replace('дартс', '').strip()
-    parts = text.split()
-    
+    parts = message.text.lower().replace('дартс', '').strip().split()
     if len(parts) < 1:
-        await message.answer(f"🎯 **ДАРТС**\n\n🎮 Использование: `дартс [ставка]`\n\nПример: `дартс 100`")
+        await message.answer("🎯 **ДАРТС**\n\n🎮 `дартс [ставка]`", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❓ Что это?", callback_data="info_darts")]]))
         return
-    
     user = await db.get_user(message.from_user.id)
-    if not user:
-        await message.answer("❌ Сначала напиши /start")
-        return
-    
+    if not user: return
     bet = parse_amount(parts[0], user['coins'])
-    
     if bet <= 0 or bet > user['coins']:
         await message.answer("❌ Некорректная ставка!")
         return
-    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎯 Центр (x5.8)", callback_data=f"darts_{bet}_center"),
-            InlineKeyboardButton(text="❌ Мимо (x5.8)", callback_data=f"darts_{bet}_miss"),
-        ],
-        [
-            InlineKeyboardButton(text="⚪ Белое (x1.9)", callback_data=f"darts_{bet}_white"),
-            InlineKeyboardButton(text="🔴 Красное (x1.9)", callback_data=f"darts_{bet}_red"),
-        ]
+        [InlineKeyboardButton(text="🎯 Центр (x5.8)", callback_data=f"dart_{bet}_center"), InlineKeyboardButton(text="❌ Мимо (x5.8)", callback_data=f"dart_{bet}_miss")],
+        [InlineKeyboardButton(text="⚪ Белое (x1.9)", callback_data=f"dart_{bet}_white"), InlineKeyboardButton(text="🔴 Красное (x1.9)", callback_data=f"dart_{bet}_red")]
     ])
-    
-    await message.answer(
-        f"🎯 **ДАРТС**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n\n"
-        f"🎯 Угадай результат:\n\n"
-        f"🎯 **Центр** — x5.8\n"
-        f"❌ **Мимо** — x5.8\n"
-        f"⚪ **Белое** — x1.9\n"
-        f"🔴 **Красное** — x1.9",
-        reply_markup=keyboard
-    )
+    await message.answer(f"🎯 **ДАРТС**\n━━━━━━━━━━━━━━━━━━━━\n\n💰 **{format_num(bet)}** VC\n\n🎯 Угадай:", reply_markup=keyboard)
 
 
-@games_router.callback_query(lambda c: c.data.startswith('darts_'))
+@games_router.callback_query(lambda c: c.data.startswith('dart_'))
 async def darts_callback(callback: CallbackQuery):
     parts = callback.data.split('_')
-    bet = int(parts[1])
-    choice = parts[2]
-    
+    bet, choice = int(parts[1]), parts[2]
     user = await db.get_user(callback.from_user.id)
     if user['coins'] < bet:
-        await callback.answer("❌ Недостаточно монет!", show_alert=True)
+        await callback.answer("❌ Нет денег!", show_alert=True)
         return
-    
     await db.update_coins(callback.from_user.id, -bet)
-    await callback.message.edit_text(f"🎯 **ДАРТС**\n\n🏹 Бросок...")
-    
+    xp = maybe_give_xp()
+    if xp > 0: await db.add_xp(callback.from_user.id, xp)
+    await callback.message.edit_text("🎯 **ДАРТС**\n\n🏹 Бросок...")
     dice = await callback.message.answer_dice(emoji="🎯")
     await asyncio.sleep(4)
-    
-    value = dice.dice.value
-    # 6 = центр, 1 = мимо, 2-3 = белое, 4-5 = красное
+    v = dice.dice.value
     result_map = {1: "miss", 2: "white", 3: "white", 4: "red", 5: "red", 6: "center"}
-    result = result_map.get(value, "miss")
-    
-    result_text = {"center": "🎯 Центр!", "miss": "❌ Мимо!", "white": "⚪ Белое", "red": "🔴 Красное"}.get(result)
-    mult = {"center": 5.8, "miss": 5.8, "white": 1.9, "red": 1.9}.get(choice, 1.9)
-    
-    won = (choice == result)
-    
+    result = result_map[v]
+    result_text = {"center": "🎯 Центр!", "miss": "❌ Мимо!", "white": "⚪ Белое", "red": "🔴 Красное"}[result]
+    mult = {"center": 5.8, "miss": 5.8, "white": 1.9, "red": 1.9}[choice]
+    won = choice == result
     if won:
-        winnings = int(bet * mult)
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
-        
-        text = f"🎯 **ДАРТС**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n✅ **ПОБЕДА!**\n📈 x{mult}\n💰 +**{format_number(winnings)} VC**"
+        win = int(bet * mult)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await callback.message.answer(f"🎯 **ДАРТС**\n━━━━━━━━━━━━━━━━━━━━\n\n{result_text}\n\n✅ x{mult} | 🏆 **+{format_num(win)}** VC")
     else:
         await db.update_stats(callback.from_user.id, False, bet)
-        text = f"🎯 **ДАРТС**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n❌ **ПРОИГРЫШ**\n💔 -{format_number(bet)} VC"
-    
-    await callback.message.answer(text)
+        await callback.message.answer(f"🎯 **ДАРТС**\n━━━━━━━━━━━━━━━━━━━━\n\n{result_text}\n\n❌ **-{format_num(bet)}** VC")
 
-
-# ==================== БОУЛИНГ ====================
 
 @games_router.message(lambda m: m.text and m.text.lower().startswith('боулинг'))
 async def bowling_start(message: Message):
-    text = message.text.lower().replace('боулинг', '').strip()
-    parts = text.split()
+    parts = message.text.lower().replace('боулинг', '').strip().split()
+    if len(parts) < 1:
+        await message.answer("🎳 **БОУЛИНГ**\n\n🎮 `боулинг [ставка]`", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❓ Что это?", callback_data="info_bowling")]]))
+        return
+    user = await db.get_user(message.from_user.id)
+    if not user: return
+    bet = parse_amount(parts[0], user['coins'])
+    if bet <= 0 or bet > user['coins']:
+        await message.answer("❌ Некорректная ставка!")
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎳 Страйк (x5.3)", callback_data=f"bowl_{bet}_strike"), InlineKeyboardButton(text="❌ Мимо (x5.3)", callback_data=f"bowl_{bet}_miss")],
+        [InlineKeyboardButton(text="1-3 (x1.9)", callback_data=f"bowl_{bet}_1-3"), InlineKeyboardButton(text="4-5 (x1.9)", callback_data=f"bowl_{bet}_4-5")]
+    ])
+    await message.answer(f"🎳 **БОУЛИНГ**\n━━━━━━━━━━━━━━━━━━━━\n\n💰 **{format_num(bet)}** VC\n\n🎯 Угадай:", reply_markup=keyboard)
+
+
+@games_router.callback_query(lambda c: c.data.startswith('bowl_'))
+async def bowling_callback(callback: CallbackQuery):
+    parts = callback.data.split('_')
+    bet, choice = int(parts[1]), parts[2]
+    user = await db.get_user(callback.from_user.id)
+    if user['coins'] < bet:
+        await callback.answer("❌ Нет денег!", show_alert=True)
+        return
+    await db.update_coins(callback.from_user.id, -bet)
+    xp = maybe_give_xp()
+    if xp > 0: await db.add_xp(callback.from_user.id, xp)
+    await callback.message.edit_text("🎳 **БОУЛИНГ**\n\n🎳 Бросок...")
+    dice = await callback.message.answer_dice(emoji="🎳")
+    await asyncio.sleep(4)
+    v = dice.dice.value
+    result_map = {1: "miss", 2: "1-3", 3: "1-3", 4: "4-5", 5: "4-5", 6: "strike"}
+    result = result_map[v]
+    result_text = {"strike": "🎳 СТРАЙК!", "miss": "❌ Мимо!", "1-3": f"🎳 {v} кегли", "4-5": f"🎳 {v} кеглей"}[result]
+    mult = {"strike": 5.3, "miss": 5.3, "1-3": 1.9, "4-5": 1.9}[choice]
+    won = choice == result
+    if won:
+        win = int(bet * mult)
+        await db.update_coins(callback.from_user.id, win)
+        await db.update_stats(callback.from_user.id, True, win)
+        await callback.message.answer(f"🎳 **БОУЛИНГ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result_text}\n\n✅ x{mult} | 🏆 **+{format_num(win)}** VC")
+    else:
+        await db.update_stats(callback.from_user.id, False, bet)
+        await callback.message.answer(f"🎳 **БОУЛИНГ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result_text}\n\n❌ **-{format_num(bet)}** VC")
+
+
+# ==================== СЛОТЫ ====================
+
+@games_router.message(lambda m: m.text and m.text.lower().startswith('слот'))
+async def slots_start(message: Message):
+    parts = message.text.lower().replace('слоты', '').replace('слот', '').strip().split()
     
     if len(parts) < 1:
-        await message.answer(f"🎳 **БОУЛИНГ**\n\n🎮 Использование: `боулинг [ставка]`\n\nПример: `боулинг 100`")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Что это?", callback_data="info_slots")]
+        ])
+        await message.answer("🎰 **СЛОТЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎮 `слоты [ставка]`\n\n📝 Пример: `слоты 100к`", reply_markup=keyboard)
         return
     
     user = await db.get_user(message.from_user.id)
-    if not user:
-        await message.answer("❌ Сначала напиши /start")
-        return
+    if not user: return
     
     bet = parse_amount(parts[0], user['coins'])
-    
     if bet <= 0 or bet > user['coins']:
         await message.answer("❌ Некорректная ставка!")
         return
     
+    await db.update_coins(message.from_user.id, -bet)
+    xp = maybe_give_xp()
+    if xp > 0: await db.add_xp(message.from_user.id, xp)
+    
+    await message.answer("🎰 **СЛОТЫ**\n\n🎲 Крутим барабаны...")
+    
+    dice = await message.answer_dice(emoji="🎰")
+    await asyncio.sleep(3)
+    
+    value = dice.dice.value
+    # Телеграм слоты: 1-64
+    # 1, 22, 43 = 777 (bar-bar-bar)
+    # 16, 32, 48, 64 = три одинаковых
+    
+    win = 0
+    result_text = ""
+    
+    if value in [1, 22, 43]:  # 777
+        win = bet * 50
+        result_text = "🎰 **777 — ДЖЕКПОТ!**"
+    elif value == 64:  # Три 7
+        win = bet * 50
+        result_text = "🎰 **777 — ДЖЕКПОТ!**"
+    elif value in [16, 32, 48]:  # Три одинаковых
+        win = bet * 10
+        result_text = "🎰 **Три одинаковых!**"
+    elif value in [2, 3, 4, 17, 18, 33, 34, 49, 50]:  # Два одинаковых
+        win = bet * 2
+        result_text = "🎰 Два совпадения"
+    else:
+        result_text = "🎰 Нет совпадений"
+    
+    if win > 0:
+        await db.update_coins(message.from_user.id, win)
+        await db.update_stats(message.from_user.id, True, win)
+        await message.answer(f"🎰 **СЛОТЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result_text}\n\n🏆 **+{format_num(win)}** VC")
+    else:
+        await db.update_stats(message.from_user.id, False, bet)
+        await message.answer(f"🎰 **СЛОТЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n{result_text}\n\n❌ **-{format_num(bet)}** VC")
+
+
+# ==================== БЛЕКДЖЕК ====================
+
+class BlackjackGame:
+    CARDS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+    
+    @staticmethod
+    def card_value(card: str, current_sum: int) -> int:
+        if card in ['J', 'Q', 'K']:
+            return 10
+        elif card == 'A':
+            return 11 if current_sum + 11 <= 21 else 1
+        else:
+            return int(card)
+    
+    @staticmethod
+    def hand_value(hand: list) -> int:
+        value = 0
+        aces = 0
+        for card in hand:
+            if card == 'A':
+                aces += 1
+            elif card in ['J', 'Q', 'K']:
+                value += 10
+            else:
+                value += int(card)
+        for _ in range(aces):
+            if value + 11 <= 21:
+                value += 11
+            else:
+                value += 1
+        return value
+    
+    @staticmethod
+    def draw_card(deck: list) -> str:
+        return deck.pop(random.randint(0, len(deck) - 1))
+    
+    @staticmethod
+    def format_hand(hand: list) -> str:
+        cards_emoji = {'2': '2️⃣', '3': '3️⃣', '4': '4️⃣', '5': '5️⃣', '6': '6️⃣', '7': '7️⃣', '8': '8️⃣', '9': '9️⃣', '10': '🔟', 'J': '🃏', 'Q': '👸', 'K': '🤴', 'A': '🅰️'}
+        return ' '.join([cards_emoji.get(c, c) for c in hand])
+
+
+@games_router.message(lambda m: m.text and (m.text.lower().startswith('блекджек') or m.text.lower().startswith('бд') or m.text.lower().startswith('blackjack')))
+async def blackjack_start(message: Message):
+    text = message.text.lower()
+    for prefix in ['блекджек', 'blackjack', 'бд']:
+        text = text.replace(prefix, '')
+    parts = text.strip().split()
+    
+    if len(parts) < 1:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Что это?", callback_data="info_blackjack")]
+        ])
+        await message.answer("🃏 **БЛЕКДЖЕК**\n━━━━━━━━━━━━━━━━━━━━\n\n🎮 `бд [ставка]`\n\n📝 Пример: `бд 100к`", reply_markup=keyboard)
+        return
+    
+    user = await db.get_user(message.from_user.id)
+    if not user: return
+    
+    bet = parse_amount(parts[0], user['coins'])
+    if bet <= 0 or bet > user['coins']:
+        await message.answer("❌ Некорректная ставка!")
+        return
+    
+    await db.update_coins(message.from_user.id, -bet)
+    xp = maybe_give_xp()
+    if xp > 0: await db.add_xp(message.from_user.id, xp)
+    
+    # Создаем колоду
+    deck = BlackjackGame.CARDS * 4
+    random.shuffle(deck)
+    
+    player_hand = [BlackjackGame.draw_card(deck), BlackjackGame.draw_card(deck)]
+    dealer_hand = [BlackjackGame.draw_card(deck), BlackjackGame.draw_card(deck)]
+    
+    player_value = BlackjackGame.hand_value(player_hand)
+    
+    state = {'deck': deck, 'player': player_hand, 'dealer': dealer_hand, 'bet': bet}
+    session_id = await db.create_game_session(message.from_user.id, 'blackjack', bet, state)
+    
+    # Блекджек с раздачи
+    if player_value == 21:
+        dealer_value = BlackjackGame.hand_value(dealer_hand)
+        await db.close_game_session(session_id)
+        
+        if dealer_value == 21:
+            await db.update_coins(message.from_user.id, bet)
+            await message.answer(f"🃏 **БЛЕКДЖЕК**\n━━━━━━━━━━━━━━━━━━━━\n\n👤 {BlackjackGame.format_hand(player_hand)} = **21**\n🤖 {BlackjackGame.format_hand(dealer_hand)} = **21**\n\n🤝 Ничья!")
+        else:
+            win = int(bet * 2.5)
+            await db.update_coins(message.from_user.id, win)
+            await db.update_stats(message.from_user.id, True, win)
+            await message.answer(f"🃏 **БЛЕКДЖЕК!**\n━━━━━━━━━━━━━━━━━━━━\n\n👤 {BlackjackGame.format_hand(player_hand)} = **21** 🎉\n\n🏆 **+{format_num(win)}** VC")
+        return
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎳 Страйк (x5.3)", callback_data=f"bowling_{bet}_strike"),
-            InlineKeyboardButton(text="❌ Мимо (x5.3)", callback_data=f"bowling_{bet}_miss"),
-        ],
-        [
-            InlineKeyboardButton(text="1️⃣-3️⃣ (x1.9)", callback_data=f"bowling_{bet}_1-3"),
-            InlineKeyboardButton(text="4️⃣-5️⃣ (x1.9)", callback_data=f"bowling_{bet}_4-5"),
-        ]
+        [InlineKeyboardButton(text="📥 Ещё карту", callback_data=f"bj_hit_{session_id}"), InlineKeyboardButton(text="✋ Хватит", callback_data=f"bj_stand_{session_id}")]
     ])
     
     await message.answer(
-        f"🎳 **БОУЛИНГ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Ставка: **{format_number(bet)} VC**\n\n"
-        f"🎯 Угадай результат:\n\n"
-        f"🎳 **Страйк** — x5.3\n"
-        f"❌ **Мимо** — x5.3\n"
-        f"1️⃣-3️⃣ **1-3 кегли** — x1.9\n"
-        f"4️⃣-5️⃣ **4-5 кеглей** — x1.9",
+        f"🃏 **БЛЕКДЖЕК**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 Ты: {BlackjackGame.format_hand(player_hand)} = **{player_value}**\n"
+        f"🤖 Дилер: {dealer_hand[0]} ❓\n\n"
+        f"💰 Ставка: **{format_num(bet)}** VC",
         reply_markup=keyboard
     )
 
 
-@games_router.callback_query(lambda c: c.data.startswith('bowling_'))
-async def bowling_callback(callback: CallbackQuery):
+@games_router.callback_query(lambda c: c.data.startswith('bj_'))
+async def blackjack_callback(callback: CallbackQuery):
     parts = callback.data.split('_')
-    bet = int(parts[1])
-    choice = parts[2]
+    action = parts[1]
+    session_id = int(parts[2])
     
-    user = await db.get_user(callback.from_user.id)
-    if user['coins'] < bet:
-        await callback.answer("❌ Недостаточно монет!", show_alert=True)
+    session = await db.get_game_session(callback.from_user.id, 'blackjack')
+    if not session or session['id'] != session_id or not session['is_active']:
+        await callback.answer("❌ Игра не найдена!", show_alert=True)
         return
     
-    await db.update_coins(callback.from_user.id, -bet)
-    await callback.message.edit_text(f"🎳 **БОУЛИНГ**\n\n🎳 Бросок...")
+    state = json.loads(session['state'])
     
-    dice = await callback.message.answer_dice(emoji="🎳")
-    await asyncio.sleep(4)
-    
-    value = dice.dice.value
-    # 6 = страйк, 1 = мимо, 2-3 = 1-3 кегли, 4-5 = 4-5 кеглей
-    result_map = {1: "miss", 2: "1-3", 3: "1-3", 4: "4-5", 5: "4-5", 6: "strike"}
-    result = result_map.get(value, "miss")
-    
-    result_text = {"strike": "🎳 СТРАЙК!", "miss": "❌ Мимо!", "1-3": f"🎳 {value} кегли", "4-5": f"🎳 {value} кеглей"}.get(result)
-    mult = {"strike": 5.3, "miss": 5.3, "1-3": 1.9, "4-5": 1.9}.get(choice, 1.9)
-    
-    won = (choice == result)
-    
-    if won:
-        winnings = int(bet * mult)
-        await db.update_coins(callback.from_user.id, winnings)
-        await db.update_stats(callback.from_user.id, True, winnings)
+    if action == "hit":
+        state['player'].append(BlackjackGame.draw_card(state['deck']))
+        player_value = BlackjackGame.hand_value(state['player'])
         
-        text = f"🎳 **БОУЛИНГ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n✅ **ПОБЕДА!**\n📈 x{mult}\n💰 +**{format_number(winnings)} VC**"
-    else:
-        await db.update_stats(callback.from_user.id, False, bet)
-        text = f"🎳 **БОУЛИНГ**\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 Результат: **{result_text}**\n\n❌ **ПРОИГРЫШ**\n💔 -{format_number(bet)} VC"
+        if player_value > 21:
+            await db.update_stats(callback.from_user.id, False, state['bet'])
+            await db.close_game_session(session_id)
+            
+            await callback.message.edit_text(
+                f"🃏 **БЛЕКДЖЕК — ПЕРЕБОР!**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"👤 {BlackjackGame.format_hand(state['player'])} = **{player_value}** 💥\n\n"
+                f"❌ **-{format_num(state['bet'])}** VC"
+            )
+            return
+        
+        if player_value == 21:
+            action = "stand"
+        else:
+            await db.update_game_session(session_id, state, True)
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📥 Ещё", callback_data=f"bj_hit_{session_id}"), InlineKeyboardButton(text="✋ Хватит", callback_data=f"bj_stand_{session_id}")]
+            ])
+            
+            await callback.message.edit_text(
+                f"🃏 **БЛЕКДЖЕК**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"👤 Ты: {BlackjackGame.format_hand(state['player'])} = **{player_value}**\n"
+                f"🤖 Дилер: {state['dealer'][0]} ❓",
+                reply_markup=keyboard
+            )
+            return
     
-    await callback.message.answer(text)
+    if action == "stand":
+        player_value = BlackjackGame.hand_value(state['player'])
+        dealer_value = BlackjackGame.hand_value(state['dealer'])
+        
+        # Дилер добирает до 17
+        while dealer_value < 17:
+            state['dealer'].append(BlackjackGame.draw_card(state['deck']))
+            dealer_value = BlackjackGame.hand_value(state['dealer'])
+        
+        await db.close_game_session(session_id)
+        
+        if dealer_value > 21:
+            win = state['bet'] * 2
+            await db.update_coins(callback.from_user.id, win)
+            await db.update_stats(callback.from_user.id, True, win)
+            result = f"🤖 Перебор!\n\n🏆 **+{format_num(win)}** VC"
+        elif player_value > dealer_value:
+            win = state['bet'] * 2
+            await db.update_coins(callback.from_user.id, win)
+            await db.update_stats(callback.from_user.id, True, win)
+            result = f"✅ Победа!\n\n🏆 **+{format_num(win)}** VC"
+        elif player_value < dealer_value:
+            await db.update_stats(callback.from_user.id, False, state['bet'])
+            result = f"❌ Проигрыш\n\n💔 **-{format_num(state['bet'])}** VC"
+        else:
+            await db.update_coins(callback.from_user.id, state['bet'])
+            result = "🤝 Ничья!"
+        
+        await callback.message.edit_text(
+            f"🃏 **БЛЕКДЖЕК**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 Ты: {BlackjackGame.format_hand(state['player'])} = **{player_value}**\n"
+            f"🤖 Дилер: {BlackjackGame.format_hand(state['dealer'])} = **{dealer_value}**\n\n"
+            f"{result}"
+        )
 
 
-# ==================== DISABLED CALLBACK ====================
+# ==================== INFO CALLBACKS ====================
 
-@games_router.callback_query(lambda c: c.data == 'game_disabled')
+@games_router.callback_query(lambda c: c.data.startswith('info_'))
+async def info_callback(callback: CallbackQuery):
+    game = callback.data.replace('info_', '')
+    
+    infos = {
+        "mines": "💣 **МИНЫ**\n\nОткрывай ячейки, избегая мин. Чем больше откроешь — тем выше множитель. Забери выигрыш в любой момент!",
+        "diamond": "💎 **АЛМАЗЫ**\n\nНайди алмаз на каждом из 16 уровней. Можешь забрать выигрыш после любого уровня.",
+        "roulette": "🎡 **РУЛЕТКА**\n\nКлассическая европейская рулетка. Красное/Чёрное x2, Зеро x36, Дюжины x3.",
+        "crash": "📈 **КРАШ**\n\nМножитель растёт. Забери до краха! Множитель от 1.01 до 505.",
+        "dice": "🎲 **КОСТИ**\n\nУгадай сумму двух кубиков: больше 7, меньше 7 или ровно 7.",
+        "football": "⚽ **ФУТБОЛ**\n\nУгадай: гол или мимо. Гол x1.8, Мимо x3.7.",
+        "basketball": "🏀 **БАСКЕТБОЛ**\n\nУгадай: попал или мимо. Попал x3.8, Мимо x1.9.",
+        "darts": "🎯 **ДАРТС**\n\nУгадай зону попадания: центр, мимо, белое или красное.",
+        "bowling": "🎳 **БОУЛИНГ**\n\nУгадай результат: страйк, мимо, 1-3 или 4-5 кеглей.",
+        "slots": "🎰 **СЛОТЫ**\n\n777 = x50, три одинаковых = x10, два одинаковых = x2.",
+        "blackjack": "🃏 **БЛЕКДЖЕК**\n\nНабери 21 или больше дилера, но не перебери! Блекджек = x2.5."
+    }
+    
+    await callback.answer(infos.get(game, "❓ Нет информации"), show_alert=True)
+
+
+@games_router.callback_query(lambda c: c.data == 'disabled')
 async def disabled_callback(callback: CallbackQuery):
     await callback.answer()
