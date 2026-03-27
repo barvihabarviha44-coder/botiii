@@ -9,24 +9,24 @@ from config import BOT_TOKEN
 from database import db
 from handlers import router
 from admin import admin_router
+from games import games_router
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-logger = logging.getLogger(__name__)
 
 
 async def main():
-    logger.info("📡 Connecting to database...")
+    logging.info("📡 Connecting to database...")
     await db.connect()
-    logger.info("✅ Database connected!")
-    
+    logging.info("✅ Database connected!")
+
     bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
-    
+
     dp = Dispatcher()
     dp.include_router(admin_router)
+    dp.include_router(games_router)
     dp.include_router(router)
-    
-    logger.info("🚀 Bot starting...")
-    
+
+    logging.info("🚀 Bot starting...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
